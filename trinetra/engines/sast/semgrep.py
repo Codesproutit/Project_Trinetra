@@ -93,12 +93,19 @@ def parse_semgrep_sarif(sarif: dict, *, discipline: str = "web") -> list[Finding
             severity = _resolve_severity(result, rule)
             cwe = _cwe_from_tags(tags) or _cwe_from_tags([message])
 
+            # Semgrep sets shortDescription to boilerplate ("Semgrep Finding: <id>")
+            # for local rules; prefer the human-written message in that case.
+            short = rule.get("shortDescription", {}).get("text")
+            if not short or short.startswith("Semgrep Finding"):
+                short = message
+            title = " ".join(short.split())[:200]  # collapse whitespace/newlines
+
             findings.append(
                 Finding(
                     discipline=discipline,
                     source="semgrep",
                     engine_layer=EngineLayer.DETERMINISTIC,
-                    title=(rule.get("shortDescription", {}).get("text") or message)[:200],
+                    title=title,
                     description=message,
                     severity=severity,
                     cwe=cwe,
