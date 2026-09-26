@@ -1,0 +1,53 @@
+{
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Semgrep",
+          "rules": [
+            {
+              "id": "python.lang.security.audit.dangerous-subprocess-use",
+              "shortDescription": { "text": "Dangerous subprocess use" },
+              "helpUri": "https://semgrep.dev/r/python.lang.security.audit.dangerous-subprocess-use",
+              "properties": { "tags": ["security", "CWE-78"] }
+            },
+            {
+              "id": "python.flask.security.injection.raw-html-format",
+              "shortDescription": { "text": "Cross-site scripting via raw HTML" },
+              "properties": { "tags": ["security", "OWASP-A03", "CWE-79"] }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "python.lang.security.audit.dangerous-subprocess-use",
+          "level": "error",
+          "message": { "text": "Detected subprocess call with shell=True" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "app/exec.py" },
+                "region": { "startLine": 12 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "python.flask.security.injection.raw-html-format",
+          "level": "warning",
+          "message": { "text": "User input rendered as raw HTML" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "app/views.py" },
+                "region": { "startLine": 40 }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
