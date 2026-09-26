@@ -34,10 +34,10 @@ _SEVERITY_STYLE = {
 }
 
 
-def _register_default_engines() -> None:
+def _register_default_engines(semgrep_config: str = "auto") -> None:
     """Register the engines available in Phase 1."""
     if "semgrep" not in [e.name for e in registry.all()]:
-        registry.register(SemgrepAdapter())
+        registry.register(SemgrepAdapter(config=semgrep_config))
         registry.register(ScaScanner())
 
 
@@ -59,9 +59,16 @@ def scan(
     engine: Annotated[
         list[str] | None, typer.Option("--engine", "-e", help="Limit to named engines")
     ] = None,
+    semgrep_config: Annotated[
+        str,
+        typer.Option(
+            "--semgrep-config",
+            help="Semgrep ruleset: 'auto' (registry, needs network) or a local rules path",
+        ),
+    ] = "auto",
 ) -> None:
     """Run a deterministic scan (SAST + SCA) and write a SARIF report."""
-    _register_default_engines()
+    _register_default_engines(semgrep_config=semgrep_config)
     cfg = RunConfig(
         source_path=path,
         disciplines=discipline or ["web"],

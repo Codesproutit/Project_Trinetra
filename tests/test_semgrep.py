@@ -28,3 +28,63 @@ def test_parse_semgrep_sarif_normalizes_findings():
 
 def test_empty_sarif_yields_no_findings():
     assert parse_semgrep_sarif({"runs": []}) == []
+
+
+def test_security_severity_property_overrides_coarse_level():
+    # Registry rules carry a CVSS-style security-severity; a critical score must
+    # win over Semgrep's coarse SARIF level ("warning").
+    sarif = {
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "rules": [
+                            {
+                                "id": "r.sqli",
+                                "properties": {
+                                    "tags": ["CWE-89"],
+                                    "security-severity": "9.8",
+                                },
+                            }
+                        ]
+                    }
+                },
+                "results": [
+                    {
+                        "ruleId": "r.sqli",
+                        "level": "warning",
+                        "message": {"text": "SQL injection"},
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": "app/db.py"},
+                                    "region": {"startLine": 3},
+                                }
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    findings = parse_semgrep_sarif(sarif)
+    assert findings[0].severity == Severity.CRITICAL
+    assert findings[0].cwe == "CWE-89"
+
+
+def test_falls_back_to_rule_default_level_when_result_level_missing():
+    sarif = {
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "rules": [
+                            {"id": "r.x", "defaultConfiguration": {"level": "error"}}
+                        ]
+                    }
+                },
+                "results": [{"ruleId": "r.x", "message": {"text": "x"}}],
+            }
+        ]
+    }
+    assert parse_semgrep_sarif(sarif)[0].severity == Severity.HIGH

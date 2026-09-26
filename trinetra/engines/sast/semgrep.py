@@ -34,6 +34,38 @@ def _cwe_from_tags(tags: list[str]) -> str | None:
     return None
 
 
+def _resolve_severity(result: dict, rule: dict) -> Severity:
+    """Resolve severity as faithfully as Semgrep's SARIF allows.
+
+    Semgrep collapses rule severity onto a coarse SARIF `level` (an ERROR rule can
+    surface as "warning"), so prefer its CVSS-style `security-severity` property
+    (present on registry rules) when available; otherwise fall back to the level,
+    then to the rule's default configuration.
+    """
+    raw = (rule.get("properties", {}) or {}).get("security-severity")
+    if raw is not None:
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            score = None
+        if score is not None:
+            if score >= 9.0:
+                return Severity.CRITICAL
+            if score >= 7.0:
+                return Severity.HIGH
+            if score >= 4.0:
+                return Severity.MEDIUM
+            if score > 0:
+                return Severity.LOW
+            return Severity.INFO
+    level = (
+        result.get("level")
+        or rule.get("defaultConfiguration", {}).get("level")
+        or "warning"
+    )
+    return _LEVEL_TO_SEVERITY.get(level, Severity.MEDIUM)
+
+
 def _rule_index(run: dict) -> dict[str, dict]:
     """Map ruleId -> rule metadata from the SARIF tool driver."""
     driver = run.get("tool", {}).get("driver", {})
@@ -58,7 +90,7 @@ def parse_semgrep_sarif(sarif: dict, *, discipline: str = "web") -> list[Finding
                 loc.file = phys.get("artifactLocation", {}).get("uri")
                 loc.line = phys.get("region", {}).get("startLine")
 
-            severity = _LEVEL_TO_SEVERITY.get(result.get("level", "warning"), Severity.MEDIUM)
+            severity = _resolve_severity(result, rule)
             cwe = _cwe_from_tags(tags) or _cwe_from_tags([message])
 
             findings.append(
