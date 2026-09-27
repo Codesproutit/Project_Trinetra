@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from trinetra import __version__
+from trinetra.ai import AiReviewer
 from trinetra.engines.base import registry
 from trinetra.engines.dast.nuclei import NucleiAdapter
 from trinetra.engines.dast.zap import ZapAdapter
@@ -23,6 +24,8 @@ from trinetra.engines.sca.sca_scanner import ScaScanner
 from trinetra.models.finding import Severity
 from trinetra.models.scope import OutOfScopeError
 from trinetra.orchestrator.pipeline import Pipeline, RunConfig
+from trinetra.providers.anthropic import AnthropicProvider
+from trinetra.providers.router import ProviderRouter
 
 app = typer.Typer(help="Trinetra — application security testing platform", no_args_is_help=True)
 console = Console()
@@ -47,6 +50,12 @@ def _register_default_engines(semgrep_config: str = "auto") -> None:
         registry.register(ZapAdapter())
     if "nuclei" not in names:
         registry.register(NucleiAdapter())
+
+
+def _build_reviewer() -> AiReviewer:
+    """Construct the AI reviewer for the configured provider (Anthropic first)."""
+    provider = AnthropicProvider()
+    return AiReviewer(ProviderRouter(provider))
 
 
 @app.command()
@@ -80,6 +89,10 @@ def scan(
             help="Semgrep ruleset: 'auto' (registry, needs network) or a local rules path",
         ),
     ] = "auto",
+    ai: Annotated[
+        bool,
+        typer.Option("--ai/--no-ai", help="Run the AI cognitive pass (BYOK; needs an API key)"),
+    ] = False,
 ) -> None:
     """Scan source (SAST+SCA), a target URL (DAST), or both (IAST) → SARIF report."""
     if not path and not target:
@@ -100,7 +113,7 @@ def scan(
         engines=engine,
         scope_manifest=scope,
     )
-    pipeline = Pipeline()
+    pipeline = Pipeline(reviewer=_build_reviewer() if ai else None)
     try:
         result = pipeline.run(cfg)
     except OutOfScopeError as exc:
@@ -114,9 +127,20 @@ def scan(
             f"[cyan]IAST:[/] {result.verification_tasks} static sink(s) queued for verification; "
             f"{result.iast_confirmed} confirmed by the dynamic scan."
         )
-    if result.skipped_engines:
+    if result.ai_reviewed:
         console.print(
-            f"[dim]Skipped (not installed here): {', '.join(result.skipped_engines)}[/]"
+            f"[cyan]AI pass:[/] reviewed {result.ai_reviewed} finding(s), "
+            f"dropped {result.ai_dropped} false positive(s); est. cost ${result.cost_usd:.4f}."
+        )
+    if "ai_reviewer" in result.skipped_engines:
+        console.print(
+            "[dim]AI pass skipped: no API key reachable. Set ANTHROPIC_API_KEY and "
+            "install trinetra[llm], or drop --ai.[/]"
+        )
+    engines_skipped = [e for e in result.skipped_engines if e != "ai_reviewer"]
+    if engines_skipped:
+        console.print(
+            f"[dim]Skipped (not installed here): {', '.join(engines_skipped)}[/]"
         )
     if result.failed_engines:
         console.print(

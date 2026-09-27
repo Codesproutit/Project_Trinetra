@@ -62,6 +62,28 @@ land in **one** finding:
 Later phases add the AI cognitive pass, the Android track, and the self-evolving learner with a
 Docker validation gate.
 
+## What's new (Phase 4 — AI cognitive pass)
+
+An optional AI layer that reads what the deterministic engines flag and cuts the noise — the
+tool's judgement layer, kept honest by a strict gate:
+
+- **Strict dedup gate** — only findings still marked *theoretical* (not dynamically confirmed),
+  from a deterministic engine, and severe enough to matter are sent to the LLM. Anything already
+  settled or IAST-confirmed is never re-reviewed, so the expensive pass stays cheap.
+- **Cognitive reviewer** — for each selected finding the LLM decides true/false positive and
+  refines severity, exploitability, and remediation. A confirmed false positive is dropped; a
+  reply that doesn't parse is kept (dropping a real bug is the costly mistake, not the reverse).
+- **BYOK + tiered routing** — reaches the model through the vendor-neutral provider router
+  (Anthropic first), which tracks tokens per model.
+- **Cost accounting** — every run reports the LLM spend in dollars.
+- **Opt-in and graceful** — off by default; enable with `--ai`. Without a reachable API key the
+  pass is skipped with a clear message, never a crash.
+
+> The AI pass needs your own API key (BYOK) to run live — set `ANTHROPIC_API_KEY` and install
+> `trinetra[llm]`. The logic and cost accounting are fully tested against a stand-in provider.
+
+Later phases add the Android track and the self-evolving learner with a Docker validation gate.
+
 ## Prerequisites
 
 - **Python 3.12+**

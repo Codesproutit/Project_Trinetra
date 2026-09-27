@@ -24,6 +24,8 @@ class ProviderRouter:
         self.settings = settings or load_settings()
         self.input_tokens = 0
         self.output_tokens = 0
+        # Per-model token accounting so cost can price each tier separately.
+        self.usage: dict[str, dict[str, int]] = {}
 
     def model_for(self, tier: Tier) -> str:
         return {
@@ -33,7 +35,11 @@ class ProviderRouter:
         }[tier]
 
     def run(self, prompt: str, *, tier: Tier, system: str | None = None) -> Completion:
-        result = self.provider.complete(prompt, model=self.model_for(tier), system=system)
+        model = self.model_for(tier)
+        result = self.provider.complete(prompt, model=model, system=system)
         self.input_tokens += result.input_tokens
         self.output_tokens += result.output_tokens
+        bucket = self.usage.setdefault(model, {"input": 0, "output": 0})
+        bucket["input"] += result.input_tokens
+        bucket["output"] += result.output_tokens
         return result

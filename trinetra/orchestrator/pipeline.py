@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+from trinetra.ai import AiReviewer, needs_review
 from trinetra.config import Settings, load_settings
 from trinetra.engines.base import EngineRegistry
 from trinetra.engines.base import registry as default_registry
@@ -38,6 +39,7 @@ from trinetra.models.scope import (
 from trinetra.orchestrator.run_store import RunStore
 from trinetra.orchestrator.scope_guard import ScopeGuard
 from trinetra.reporting.sarif import write_sarif
+from trinetra.telemetry.cost import router_cost
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,9 @@ class RunResult:
     failed_engines: list[str] = field(default_factory=list)
     iast_confirmed: int = 0  # static findings upgraded by dynamic confirmation
     verification_tasks: int = 0  # static sinks queued for dynamic verification
+    ai_reviewed: int = 0  # findings sent through the AI cognitive pass
+    ai_dropped: int = 0  # confirmed false positives the AI removed
+    cost_usd: float = 0.0  # LLM spend for this run
 
 
 def dedup(findings: list[Finding]) -> list[Finding]:
@@ -108,12 +113,15 @@ class Pipeline:
         settings: Settings | None = None,
         engine_registry: EngineRegistry | None = None,
         oast: OastListener | None = None,
+        reviewer: AiReviewer | None = None,
     ):
         self.settings = settings or load_settings()
         self.registry = engine_registry or default_registry
         # NullOastBackend never yields interactions, so target/iast mode without a
         # real interaction server degrades to "no OAST findings" rather than failing.
         self.oast = oast or OastListener(backend=NullOastBackend())
+        # The AI cognitive pass is opt-in (BYOK). None => deterministic-only run.
+        self.reviewer = reviewer
 
     def _build_guard(self, cfg: RunConfig) -> ScopeGuard:
         if cfg.scope_manifest:
@@ -200,7 +208,32 @@ class Pipeline:
             iast_confirmed = result.confirmed_count
 
         findings = dedup(static_findings + dynamic_findings)
-        # >>> Later phases hook in here: AI cognitive pass -> learner.
+
+        # AI cognitive pass (opt-in, BYOK): review only the deterministic,
+        # still-theoretical findings the dedup gate selects — never re-review a
+        # settled or confirmed finding. Enriches survivors, drops confirmed FPs.
+        ai_reviewed = 0
+        ai_dropped = 0
+        cost_usd = 0.0
+        if self.reviewer is not None:
+            if self.reviewer.available():
+                to_review = needs_review(findings)
+                try:
+                    outcome = self.reviewer.review(to_review)
+                    reviewed_fps = {f.fingerprint for f in to_review}
+                    findings = [
+                        f for f in findings if f.fingerprint not in reviewed_fps
+                    ] + outcome.findings
+                    findings = dedup(findings)
+                    ai_reviewed = outcome.reviewed
+                    ai_dropped = outcome.dropped
+                except Exception:  # noqa: BLE001 - AI failure must not lose deterministic results
+                    logger.exception("AI cognitive pass failed; keeping deterministic findings")
+                    failed.append("ai_reviewer")
+                cost_usd = router_cost(self.reviewer.router).usd
+            else:
+                skipped.append("ai_reviewer")
+        # >>> Later phases hook in here: learner.
 
         store = RunStore(self.settings.run_dir)
         store.write_findings(findings)
@@ -213,6 +246,9 @@ class Pipeline:
             failed_engines=sorted(set(failed)),
             iast_confirmed=iast_confirmed,
             verification_tasks=len(tasks),
+            ai_reviewed=ai_reviewed,
+            ai_dropped=ai_dropped,
+            cost_usd=cost_usd,
         )
 
 

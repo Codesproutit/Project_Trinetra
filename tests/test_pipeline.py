@@ -235,3 +235,69 @@ def test_iast_mode_confirms_static_sink_from_dynamic_finding(tmp_path):
     assert result.iast_confirmed == 1
     upgraded = next(f for f in result.findings if f.source == "semgrep")
     assert upgraded.confidence == Confidence.CONFIRMED
+
+
+def test_ai_pass_reviews_and_records_cost(tmp_path):
+    from trinetra.ai import AiReviewer
+    from trinetra.providers.base import Completion
+    from trinetra.providers.router import ProviderRouter
+
+    class _Provider:
+        name = "fake"
+
+        def available(self):
+            return True
+
+        def complete(self, prompt, *, model, system=None):
+            return Completion(
+                text='{"verdict":"true_positive","severity":"critical"}',
+                input_tokens=1_000_000,
+                output_tokens=0,
+                model=model,
+            )
+
+    finding = Finding(
+        discipline="web", source="semgrep", title="SQLi", rule_id="sqli",
+        severity=Severity.HIGH, cwe="CWE-89", location=Location(file="a.py", line=1),
+    )
+    reg = EngineRegistry()
+    reg.register(_FakeEngine([finding]))
+    settings = Settings(run_dir=tmp_path / "runs")
+    src = tmp_path / "src"
+    src.mkdir()
+    reviewer = AiReviewer(ProviderRouter(_Provider()))
+    result = Pipeline(settings=settings, engine_registry=reg, reviewer=reviewer).run(
+        RunConfig(source_path=str(src), disciplines=["web"])
+    )
+    assert result.ai_reviewed == 1
+    assert result.cost_usd > 0  # 1M input tokens @ sonnet-5 = $2
+    assert next(f for f in result.findings if f.source == "semgrep").severity == Severity.CRITICAL
+
+
+def test_ai_pass_skipped_when_provider_unavailable(tmp_path):
+    from trinetra.ai import AiReviewer
+    from trinetra.providers.router import ProviderRouter
+
+    class _NoKey:
+        name = "nokey"
+
+        def available(self):
+            return False
+
+        def complete(self, prompt, *, model, system=None):  # pragma: no cover
+            raise AssertionError
+
+    finding = Finding(
+        discipline="web", source="semgrep", title="X", rule_id="x",
+        severity=Severity.HIGH, location=Location(file="a.py", line=1),
+    )
+    reg = EngineRegistry()
+    reg.register(_FakeEngine([finding]))
+    settings = Settings(run_dir=tmp_path / "runs")
+    src = tmp_path / "src"
+    src.mkdir()
+    result = Pipeline(
+        settings=settings, engine_registry=reg, reviewer=AiReviewer(ProviderRouter(_NoKey()))
+    ).run(RunConfig(source_path=str(src), disciplines=["web"]))
+    assert "ai_reviewer" in result.skipped_engines
+    assert result.ai_reviewed == 0
