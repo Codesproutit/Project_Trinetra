@@ -21,7 +21,7 @@ from trinetra.engines.base import registry
 from trinetra.engines.dast.nuclei import NucleiAdapter
 from trinetra.engines.dast.zap import ZapAdapter
 from trinetra.engines.mobile.android import ApkStaticAdapter
-from trinetra.engines.sast.semgrep import SemgrepAdapter
+from trinetra.engines.sast.semgrep import BUNDLED, SemgrepAdapter
 from trinetra.engines.sca.sca_scanner import ScaScanner
 from trinetra.learner import Learner, SandboxValidator, SemgrepRuleRunner
 from trinetra.models.finding import Severity
@@ -43,11 +43,26 @@ _SEVERITY_STYLE = {
 }
 
 
-def _register_default_engines(semgrep_config: str = "auto") -> None:
+BRAINS_ROOT = ".trinetra/brains"
+
+
+def _learned_rules(disciplines: list[str]) -> dict:
+    """Rules the learner promoted into each discipline's brain, so they run on every scan."""
+    return {d: FileBrain(d, BRAINS_ROOT).load_rules() for d in disciplines}
+
+
+def _register_default_engines(
+    semgrep_configs: list[str] | None = None, disciplines: list[str] | None = None
+) -> None:
     """Register the engines Trinetra ships with (source + target)."""
     names = {e.name for e in registry.all()}
     if "semgrep" not in names:
-        registry.register(SemgrepAdapter(config=semgrep_config))
+        registry.register(
+            SemgrepAdapter(
+                semgrep_configs or [BUNDLED],
+                learned_rules=_learned_rules(disciplines or ["web"]),
+            )
+        )
     if "sca" not in names:
         registry.register(ScaScanner())
     if "zap" not in names:
@@ -70,7 +85,7 @@ def _build_learner(disciplines: list[str]) -> Learner:
     The gate uses a local Semgrep runner; without Semgrep/Docker present it reports
     'skipped' and the loop promotes nothing (fail-closed).
     """
-    brains_root = ".trinetra/brains"
+    brains_root = BRAINS_ROOT
     brains = {d: FileBrain(d, brains_root) for d in disciplines}
     validator = SandboxValidator(
         SemgrepRuleRunner(),
@@ -109,12 +124,15 @@ def scan(
         list[str] | None, typer.Option("--engine", "-e", help="Limit to named engines")
     ] = None,
     semgrep_config: Annotated[
-        str,
+        list[str] | None,
         typer.Option(
             "--semgrep-config",
-            help="Semgrep ruleset: 'auto' (registry, needs network) or a local rules path",
+            help=(
+                "Semgrep ruleset (repeatable). Default 'bundled' = Trinetra's offline rules. "
+                "Add 'auto' or 'p/owasp-top-ten' for the online registry, or a local rules path."
+            ),
         ),
-    ] = "auto",
+    ] = None,
     ai: Annotated[
         bool,
         typer.Option("--ai/--no-ai", help="Run the AI cognitive pass (BYOK; needs an API key)"),
@@ -148,8 +166,8 @@ def scan(
         console.print(f"[bold red]Unknown report format(s):[/] {', '.join(bad)}. One of {FORMATS}.")
         raise typer.Exit(code=2)
 
-    _register_default_engines(semgrep_config=semgrep_config)
     disciplines = discipline or (["android"] if apk else ["web"])
+    _register_default_engines(semgrep_configs=semgrep_config, disciplines=disciplines)
     cfg = RunConfig(
         source_path=path,
         target_url=target,

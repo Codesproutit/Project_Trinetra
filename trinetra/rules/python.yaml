@@ -1,0 +1,429 @@
+# Trinetra bundled Python ruleset (offline, no registry needed).
+#
+# Every rule has a positive (`ruleid:`) and negative (`ok:`) case in
+# tests/semgrep_targets/python.py, checked by `semgrep --test` (tests/test_rules.py).
+# Rules exclude constant, literal-only arguments so a hardcoded, harmless call does
+# not raise a finding; that is the main false-positive lever for pattern rules.
+rules:
+  # ---------------------------------------------------------------- injection
+  - id: trinetra.python.sql-injection
+    languages: [python]
+    severity: ERROR
+    message: >-
+      SQL injection: the query is built with string formatting or concatenation
+      instead of bound parameters. Pass values as parameters, e.g.
+      cursor.execute("SELECT ... WHERE id = %s", (user_id,)).
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: $CUR.$EXEC(f"...", ...)
+          - pattern: $CUR.$EXEC("..." % $ARGS, ...)
+          - pattern: $CUR.$EXEC("...".format(...), ...)
+          - pattern: $CUR.$EXEC("..." + $X, ...)
+          - pattern: $CUR.$EXEC($X + "...", ...)
+          # The query is built into a variable first, then executed.
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      $Q = f"..."
+                      ...
+                  - pattern-inside: |
+                      $Q = "..." % $ARGS
+                      ...
+                  - pattern-inside: |
+                      $Q = "...".format(...)
+                      ...
+                  - pattern-inside: |
+                      $Q = "..." + $X
+                      ...
+                  - pattern-inside: |
+                      $Q = $X + "..."
+                      ...
+              - pattern: $CUR.$EXEC($Q, ...)
+          - pattern: sqlalchemy.text(f"...")
+          - pattern: sqlalchemy.text("..." % $ARGS)
+          - pattern: sqlalchemy.text("...".format(...))
+      - metavariable-regex:
+          metavariable: $EXEC
+          regex: ^(execute|executemany|executescript|raw|extra|text)$
+      # An f-string with no placeholders is a constant, not an injection.
+      - pattern-not: $CUR.$EXEC(f"$CONST", ...)
+
+  - id: trinetra.python.command-injection-shell
+    languages: [python]
+    severity: ERROR
+    message: >-
+      OS command injection: a shell command is built from a non-constant value.
+      Pass an argument list without shell=True (subprocess.run(["ping", host]))
+      and validate the input.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.$FN($CMD, ..., shell=True, ...)
+          - pattern: os.system($CMD)
+          - pattern: os.popen($CMD, ...)
+          - pattern: commands.getoutput($CMD)
+          - pattern: commands.getstatusoutput($CMD)
+      - pattern-not: subprocess.$FN("...", ..., shell=True, ...)
+      - pattern-not: os.system("...")
+      - pattern-not: os.popen("...", ...)
+
+  - id: trinetra.python.code-injection
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Code injection: eval()/exec() run a non-constant value. An attacker who
+      controls it can run arbitrary Python. Use ast.literal_eval or a parser.
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: eval($X, ...)
+          - pattern: exec($X, ...)
+      - pattern-not: eval("...", ...)
+      - pattern-not: exec("...", ...)
+
+  - id: trinetra.python.flask-ssti
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Server-side template injection: render_template_string() renders a
+      non-constant template. Render a fixed template and pass data as variables.
+    metadata:
+      cwe: "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern: flask.render_template_string($T, ...)
+      - pattern-not: flask.render_template_string("...", ...)
+
+  # ------------------------------------------------ user input -> sink (taint)
+  - id: trinetra.python.web-path-traversal
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Path traversal: a file path comes from the request. An attacker can use
+      "../" to read or write files outside the intended folder. Resolve the path
+      and check it stays inside an allowed base directory
+      (or use werkzeug.utils.safe_join / flask.send_from_directory).
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory"
+      owasp: "A01:2021 - Broken Access Control"
+      confidence: HIGH
+    pattern-sources:
+      - pattern: flask.request.$ATTR
+      - pattern: $REQ.GET
+      - pattern: $REQ.POST
+      - pattern: $REQ.FILES
+    pattern-sanitizers:
+      - pattern: werkzeug.utils.secure_filename(...)
+      - pattern: werkzeug.utils.safe_join(...)
+      - pattern: os.path.basename(...)
+    pattern-sinks:
+      - pattern: open($P, ...)
+      - pattern: flask.send_file($P, ...)
+      - pattern: os.remove($P)
+      - pattern: os.unlink($P)
+      - pattern: shutil.rmtree($P, ...)
+      - pattern: pathlib.Path($P, ...)
+
+  - id: trinetra.python.web-ssrf
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Server-side request forgery: the server fetches a URL taken from the
+      request. An attacker can make it call internal services or cloud metadata
+      endpoints. Allow-list hosts and schemes before fetching.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery"
+      confidence: HIGH
+    pattern-sources:
+      - pattern: flask.request.$ATTR
+      - pattern: $REQ.GET
+      - pattern: $REQ.POST
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.$M($URL, ...)
+              - pattern: httpx.$M($URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+          - focus-metavariable: $URL
+
+  - id: trinetra.python.web-open-redirect
+    languages: [python]
+    severity: WARNING
+    mode: taint
+    message: >-
+      Open redirect: the redirect target comes from the request, so a link to
+      this site can send users to an attacker's page. Only redirect to relative
+      paths or allow-listed hosts.
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+      owasp: "A01:2021 - Broken Access Control"
+      confidence: HIGH
+    pattern-sources:
+      - pattern: flask.request.$ATTR
+      - pattern: $REQ.GET
+    pattern-sinks:
+      - pattern: flask.redirect($U, ...)
+      - pattern: django.shortcuts.redirect($U, ...)
+      - pattern: django.http.HttpResponseRedirect($U, ...)
+
+  - id: trinetra.python.web-reflected-xss
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Cross-site scripting: request data is returned as HTML without escaping.
+      Render it through an auto-escaping template or escape it (markupsafe.escape).
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    pattern-sources:
+      - pattern: flask.request.$ATTR
+      - pattern: $REQ.GET
+      - pattern: $REQ.POST
+    pattern-sanitizers:
+      - pattern: markupsafe.escape(...)
+      - pattern: html.escape(...)
+      - pattern: flask.escape(...)
+      - pattern: int(...)
+    pattern-sinks:
+      - pattern: flask.make_response($BODY, ...)
+      - pattern: django.utils.safestring.mark_safe($BODY)
+      - pattern: django.http.HttpResponse($BODY, ...)
+      - pattern: markupsafe.Markup($BODY)
+      # A view that returns HTML built by hand from request data.
+      - patterns:
+          - pattern-inside: |
+              @$APP.route(...)
+              def $F(...):
+                ...
+          - pattern-either:
+              - pattern: return "..." + $X
+              - pattern: return $X + "..."
+              - pattern: return f"..."
+              - pattern: return "...".format(...)
+              - pattern: return "..." % $X
+
+  # ------------------------------------------------------------ deserialization
+  - id: trinetra.python.insecure-deserialization
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Insecure deserialization: pickle/marshal/dill/jsonpickle and yaml.load
+      without a safe loader can execute code while loading. Never deserialize
+      untrusted data with them; use JSON or yaml.safe_load.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+      - pattern: pickle.Unpickler(...)
+      - pattern: _pickle.loads(...)
+      - pattern: cPickle.loads(...)
+      - pattern: dill.loads(...)
+      - pattern: dill.load(...)
+      - pattern: marshal.loads(...)
+      - pattern: shelve.open(...)
+      - pattern: jsonpickle.decode(...)
+      - pattern: yaml.unsafe_load(...)
+      - pattern: yaml.full_load(...)
+      - patterns:
+          - pattern: yaml.load(...)
+          - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+          - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+          - pattern-not: yaml.load(..., Loader=SafeLoader, ...)
+
+  - id: trinetra.python.xxe-unsafe-parser
+    languages: [python]
+    severity: WARNING
+    message: >-
+      XML external entities: this parser resolves entities, allowing file
+      disclosure or SSRF through a crafted document. Use defusedxml, or set
+      resolve_entities=False.
+    metadata:
+      cwe: "CWE-611: Improper Restriction of XML External Entity Reference"
+      owasp: "A05:2021 - Security Misconfiguration"
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: lxml.etree.XMLParser(..., resolve_entities=True, ...)
+      - pattern: xml.sax.make_parser(...)
+      - pattern: xml.dom.pulldom.parse(...)
+
+  # ---------------------------------------------------------------- crypto/TLS
+  - id: trinetra.python.weak-hash
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Weak hash: MD5 and SHA-1 are broken for security use (passwords,
+      signatures, integrity). Use SHA-256+, and bcrypt/scrypt/argon2 for
+      passwords. If this is not security-related, pass usedforsecurity=False.
+    metadata:
+      cwe: "CWE-328: Use of Weak Hash"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: hashlib.md5(...)
+          - pattern: hashlib.sha1(...)
+          - pattern: hashlib.new("md5", ...)
+          - pattern: hashlib.new("sha1", ...)
+          - pattern: hashlib.new("MD5", ...)
+          - pattern: hashlib.new("SHA1", ...)
+      - pattern-not: hashlib.$H(..., usedforsecurity=False, ...)
+
+  - id: trinetra.python.tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled, so any man-in-the-middle can
+      read and alter this traffic. Remove verify=False / CERT_NONE.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: HIGH
+    pattern-either:
+      - pattern: requests.$M(..., verify=False, ...)
+      - pattern: httpx.$M(..., verify=False, ...)
+      - pattern: ssl._create_unverified_context(...)
+      - pattern: $CTX.verify_mode = ssl.CERT_NONE
+      - pattern: $CTX.check_hostname = False
+
+  - id: trinetra.python.insecure-random-token
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Predictable randomness: the `random` module is not cryptographically
+      secure, so tokens, passwords or keys made with it can be guessed. Use the
+      `secrets` module.
+    metadata:
+      cwe: "CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: MEDIUM
+    patterns:
+      - pattern: $NAME = <... random.$FN(...) ...>
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(token|secret|passw|pwd|otp|nonce|salt|session|api_?key|reset).*
+
+  # ------------------------------------------------------------- configuration
+  - id: trinetra.python.flask-debug-enabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Flask debug mode is on. The Werkzeug debugger lets anyone who reaches it
+      run code on the server. Never enable debug in production.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 - Security Misconfiguration"
+      confidence: HIGH
+    pattern-either:
+      - pattern: $APP.run(..., debug=True, ...)
+      - pattern: $APP.debug = True
+      - pattern: $APP.config["DEBUG"] = True
+
+  - id: trinetra.python.django-debug-enabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Django DEBUG = True leaks stack traces, settings and SQL to visitors.
+      Load it from the environment and keep it False in production.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 - Security Misconfiguration"
+      confidence: MEDIUM
+    patterns:
+      - pattern: DEBUG = True
+      - pattern-inside: |
+          ...
+          INSTALLED_APPS = ...
+          ...
+
+  - id: trinetra.python.jinja2-autoescape-disabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Jinja2 autoescaping is off, so any variable rendered into HTML can inject
+      script (XSS). Use autoescape=True or select_autoescape().
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+    pattern-either:
+      - pattern: jinja2.Environment(..., autoescape=False, ...)
+      - patterns:
+          - pattern: jinja2.Environment(...)
+          - pattern-not: jinja2.Environment(..., autoescape=$A, ...)
+
+  - id: trinetra.python.insecure-tempfile
+    languages: [python]
+    severity: WARNING
+    message: >-
+      tempfile.mktemp() only returns a name; another process can create the file
+      first (race condition). Use tempfile.mkstemp() or NamedTemporaryFile().
+    metadata:
+      cwe: "CWE-377: Insecure Temporary File"
+      confidence: HIGH
+    pattern: tempfile.mktemp(...)
+
+  - id: trinetra.python.jwt-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      JWT signature verification is disabled, so anyone can forge a token.
+      Always verify the signature and pin the algorithms list.
+    metadata:
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: HIGH
+    pattern-either:
+      - pattern: jwt.decode(..., verify=False, ...)
+      - pattern: 'jwt.decode(..., options={..., "verify_signature": False, ...}, ...)'
+      - pattern: jwt.decode(..., algorithms=[..., "none", ...], ...)
+
+  # ------------------------------------------------------------------- secrets
+  - id: trinetra.python.hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Hardcoded credential in source code. Anyone with access to the code (or its
+      git history) can read it. Load it from an environment variable or a secret
+      manager, and rotate the exposed value.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+      confidence: MEDIUM
+    options:
+      constant_propagation: false
+    patterns:
+      - pattern-either:
+          - pattern: $NAME = "$VALUE"
+          - pattern: $OBJ.$NAME = "$VALUE"
+          - pattern: '{..., "$NAME": "$VALUE", ...}'
+          - pattern: $FN(..., $NAME="$VALUE", ...)
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)^.*(passw|pwd|secret|api_?key|apikey|access_?key|auth_?token|access_?token|private_?key|client_?secret|credential).*$
+      # Names that describe a secret without holding one (field names, header
+      # names, env-var names, URLs) and obvious placeholders are not findings.
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)^(?!.*(_field|_name|_header|_env|_var|_url|_path|_file|_prompt|_label|_len|_length|_min|_max|_regex|_pattern)$).*$
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: ^(?!(?i:changeme|change_me|your[_-].*|example.*|xxx+|\*+|<.*>|\$\{.*\}|%\(.*\)s|none|null|true|false|password|secret|test|dummy)$)\S{6,}$
