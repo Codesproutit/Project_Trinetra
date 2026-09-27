@@ -7,6 +7,8 @@ runs without it.
 
 from __future__ import annotations
 
+import os
+
 from trinetra.providers.base import Completion
 
 
@@ -18,6 +20,14 @@ class AnthropicProvider:
         # profile. It is supplied by the tester at pre-flight (BYOK).
         self._api_key = api_key
         self._client = None
+
+    def available(self) -> bool:
+        """True only if the SDK is installed and a key is reachable (BYOK)."""
+        try:
+            import anthropic  # noqa: F401
+        except ModuleNotFoundError:
+            return False
+        return bool(self._api_key or os.getenv("ANTHROPIC_API_KEY"))
 
     def _get_client(self):
         if self._client is None:
