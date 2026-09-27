@@ -81,9 +81,9 @@ def scan(
         ),
     ] = "auto",
 ) -> None:
-    """Scan a source path (SAST + SCA) or a running target URL (DAST) → SARIF report."""
-    if bool(path) == bool(target):
-        console.print("[bold red]Provide exactly one of[/] --path [bold red]or[/] --target.")
+    """Scan source (SAST+SCA), a target URL (DAST), or both (IAST) → SARIF report."""
+    if not path and not target:
+        console.print("[bold red]Provide[/] --path[bold red],[/] --target[bold red], or both.[/]")
         raise typer.Exit(code=2)
     if target and not scope:
         console.print(
@@ -109,6 +109,11 @@ def scan(
 
     _print_summary(result)
     console.print(f"\n[green]SARIF written:[/] {result.sarif_path}")
+    if result.verification_tasks:
+        console.print(
+            f"[cyan]IAST:[/] {result.verification_tasks} static sink(s) queued for verification; "
+            f"{result.iast_confirmed} confirmed by the dynamic scan."
+        )
     if result.skipped_engines:
         console.print(
             f"[dim]Skipped (not installed here): {', '.join(result.skipped_engines)}[/]"
