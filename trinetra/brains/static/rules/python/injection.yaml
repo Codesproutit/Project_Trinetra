@@ -1,0 +1,1064 @@
+# Trinetra static brain: Python injection rules.
+#
+# Four vulnerability classes: SQL (CWE-89), OS command (CWE-78), code (CWE-94) and
+# LDAP (CWE-90) injection. Each is detected in up to three ways (see ../../README.md):
+#   *-tainted        taint mode, sources are real HTTP request data (Flask, Django,
+#                    Django REST framework, FastAPI/Starlette, aiohttp, Tornado and
+#                    route-handler parameters). Confidence HIGH.
+#   *-dynamic-*      a string built at runtime (f-string, %, .format(), +, += or an
+#                    inline join) from a non-constant value reaches the sink, source
+#                    unknown (for example a function parameter). For eval/exec, any
+#                    non-constant argument. Confidence MEDIUM.
+#   *-local-tainted  the same sinks fed by command-line / stdin input (sys.argv,
+#                    input(), argparse). Only a vulnerability when the program runs
+#                    with more privilege than its caller. Confidence LOW.
+#
+# Shared YAML anchors: the first rule of each class defines its sources, sinks and
+# sanitizers; later rules reuse them with aliases, so edit the anchored copy.
+# Semgrep OSS taint analysis is intraprocedural: flows through helper functions
+# are not followed (see the todoruleid cases in the fixture).
+
+rules:
+  # =========================================================================
+  # SQL injection (CWE-89)
+  # =========================================================================
+  - id: py-sqli-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Data from the HTTP request is placed into a raw SQL statement. An attacker can
+      change the query to read, modify or delete any data the database account can
+      reach. Pass values as bound parameters (cursor.execute(sql, params), text() with
+      bind parameters, Django raw(sql, params)) and map table, column or sort names
+      through a fixed allowlist.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "8.8"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Query_Parameterization_Cheat_Sheet.html
+        - https://docs.djangoproject.com/en/stable/topics/db/sql/#passing-parameters-into-raw
+    mode: taint
+    options: &taint-options
+      taint_assume_safe_indexes: true
+      taint_assume_safe_booleans: true
+      taint_assume_safe_numbers: true
+    # Values appended to a list taint the list: parts.append(f"name = '{n}'").
+    pattern-propagators: &list-propagators
+      - patterns:
+          - pattern: $LIST.$ADD($VALUE)
+          - metavariable-regex:
+              metavariable: $ADD
+              regex: ^(append|extend|add|appendleft)$
+        from: $VALUE
+        to: $LIST
+    pattern-sources: &web-sources
+      # Flask / Werkzeug, Django, Django REST framework, Starlette and aiohttp
+      # request attributes, when the request object is called `request`.
+      - patterns:
+          - pattern-either:
+              - pattern: flask.request.$ATTR
+              - pattern: request.$ATTR
+              - pattern: self.request.$ATTR
+          - metavariable-regex:
+              metavariable: $ATTR
+              regex: ^(args|form|values|json|cookies|headers|data|files|view_args|query_string|stream|path|full_path|url|body|query|match_info|query_params|path_params|GET|POST|COOKIES|META|FILES|path_info|arguments|body_arguments|query_arguments)$
+      # Request body readers: Flask get_json()/get_data(), Starlette and aiohttp
+      # `await request.json()/form()/body()/text()/post()`, Django read().
+      - patterns:
+          - pattern-either:
+              - pattern: flask.request.$METHOD(...)
+              - pattern: request.$METHOD(...)
+              - pattern: self.request.$METHOD(...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(get_json|get_data|json|form|body|text|post|read|readline|readlines|get_full_path)$
+      # Django / DRF / Starlette attributes that only exist on request objects,
+      # whatever the variable is called.
+      - patterns:
+          - pattern: $REQ.$ATTR
+          - metavariable-regex:
+              metavariable: $ATTR
+              regex: ^(GET|POST|COOKIES|META|FILES|query_params|path_params)$
+      # FastAPI / Starlette handlers with a parameter typed `Request`.
+      - patterns:
+          - pattern-inside: |
+              def $HANDLER(..., $REQ: $REQTYPE, ...):
+                  ...
+          - metavariable-regex:
+              metavariable: $REQTYPE
+              regex: ^(.*\.)?(Request|HttpRequest|WebSocket)$
+          - pattern-either:
+              - patterns:
+                  - pattern: $REQ.$ATTR
+                  - metavariable-regex:
+                      metavariable: $ATTR
+                      regex: ^(query_params|path_params|cookies|headers|url|body|GET|POST|COOKIES|META|FILES)$
+              - patterns:
+                  - pattern: $REQ.$METHOD(...)
+                  - metavariable-regex:
+                      metavariable: $METHOD
+                      regex: ^(json|form|body|stream|receive_text|receive_json|receive_bytes|read)$
+      # Tornado RequestHandler accessors.
+      - patterns:
+          - pattern: self.$METHOD(...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(get_(query_|body_)?arguments?|get_cookie)$
+      # Parameters of Flask / FastAPI route handlers carry URL path, query and body
+      # values. Framework-validated numeric types and injected dependencies are safe.
+      - patterns:
+          - pattern-inside: |
+              @$APP.$ROUTE(...)
+              def $VIEW(..., $PARAM, ...):
+                  ...
+          - metavariable-regex:
+              metavariable: $ROUTE
+              regex: ^(route|get|post|put|patch|delete|api_route)$
+          - focus-metavariable: $PARAM
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: ^(?!(self|cls|request|req|response|background_tasks)$)
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM = Depends(...), ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: $TYPE = Depends(...), ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: $TYPE = Security(...), ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: int, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: int = $DEFAULT, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: float, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: float = $DEFAULT, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: bool, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: bool = $DEFAULT, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: UUID, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: uuid.UUID, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: Request, ...):
+                  ...
+          - pattern-not-inside: |
+              def $VIEW(..., $PARAM: Annotated[$TYPE, Depends(...)], ...):
+                  ...
+    pattern-sanitizers: &sqli-sanitizers
+      # Numeric casts, typed request getters (request.args.get("n", type=int)) and
+      # lookups in constant allowlist maps (SORT_COLUMNS[key]). A cast that wraps a
+      # sink call, such as int(check_output(cmd, shell=True)), does not hide it.
+      - &sanitize-casts
+        patterns:
+          - pattern-either:
+              - pattern: int(...)
+              - pattern: float(...)
+              - pattern: bool(...)
+              - pattern: len(...)
+              - pattern: abs(...)
+              - pattern: round(...)
+              - pattern: uuid.UUID(...)
+              - pattern: decimal.Decimal(...)
+              - patterns:
+                  - pattern-either:
+                      - pattern: $MAP.get(..., type=$TYPE, ...)
+                      - pattern: $MAP.getlist(..., type=$TYPE, ...)
+                  - metavariable-regex:
+                      metavariable: $TYPE
+                      regex: ^(int|float|bool|UUID|uuid\.UUID)$
+              - patterns:
+                  - pattern-either:
+                      - pattern: $ALLOWED.get(...)
+                      - pattern: $ALLOWED[$KEY]
+                  - metavariable-regex:
+                      metavariable: $ALLOWED
+                      regex: ^(?!(.*\.)?(GET|POST|COOKIES|META|FILES)\b)([\w.]+\.)?[A-Z][A-Z0-9_]*$
+          - pattern-not: $CAST(..., <... os.$FUNC(...) ...>, ...)
+          - pattern-not: $CAST(..., <... subprocess.$FUNC(...) ...>, ...)
+          - pattern-not: $CAST(..., <... $DB.execute(...) ...>, ...)
+          - pattern-not: $CAST(..., <... $DB.executemany(...) ...>, ...)
+          - pattern-not: $CAST(..., <... pandas.$FUNC(...) ...>, ...)
+          - pattern-not: $CAST(..., <... eval(...) ...>, ...)
+          - pattern-not: $CAST(..., <... exec(...) ...>, ...)
+          - pattern-not: $CAST(..., <... $LDAP.search_s(...) ...>, ...)
+          - pattern-not: $CAST(..., <... $LDAP.search(...) ...>, ...)
+      # Variables assigned from a cast, a typed getter or a constant allowlist map,
+      # and parameters annotated with a numeric type.
+      - &sanitize-validated-vars
+        patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $V = int(...)
+                  ...
+              - pattern-inside: |
+                  $V = float(...)
+                  ...
+              - pattern-inside: |
+                  $V = len(...)
+                  ...
+              - pattern-inside: |
+                  $V = uuid.UUID(...)
+                  ...
+              - pattern-inside: |
+                  $V = $ARGS.get(..., type=int, ...)
+                  ...
+              - pattern-inside: |
+                  $V = $ARGS.get(..., type=float, ...)
+                  ...
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $V = $ALLOWED[$KEY]
+                          ...
+                      - pattern-inside: |
+                          $V = $ALLOWED.get(...)
+                          ...
+                  - metavariable-regex:
+                      metavariable: $ALLOWED
+                      regex: ^(?!(.*\.)?(GET|POST|COOKIES|META|FILES)\b)([\w.]+\.)?[A-Z][A-Z0-9_]*$
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          def $FUNC(..., $V: $TYPE, ...):
+                              ...
+                      - pattern-inside: |
+                          def $FUNC(..., $V: $TYPE = $DEFAULT, ...):
+                              ...
+                  - metavariable-regex:
+                      metavariable: $TYPE
+                      regex: ^(int|float|bool|UUID|uuid\.UUID|Decimal|decimal\.Decimal|datetime|date)$
+          - pattern: $V
+      # Allowlist and format guards: inside `if v in ALLOWED:` / `if v.isdigit():`, or
+      # after `if v not in ALLOWED:` whose branch ends in raise, return or abort().
+      - &sanitize-guards
+        patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  if $V in $ALLOWED:
+                      ...
+              - pattern-inside: |
+                  if $RX.fullmatch(..., $V):
+                      ...
+              - pattern-inside: |
+                  if $V not in $ALLOWED:
+                      ...
+                      raise $EXC
+                  ...
+              - pattern-inside: |
+                  if $V not in $ALLOWED:
+                      ...
+                      return ...
+                  ...
+              - pattern-inside: |
+                  if not $RX.fullmatch(..., $V):
+                      ...
+                      raise $EXC
+                  ...
+              - pattern-inside: |
+                  if not $RX.fullmatch(..., $V):
+                      ...
+                      return ...
+                  ...
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          if $V.$CHECK():
+                              ...
+                      - pattern-inside: |
+                          if not $V.$CHECK():
+                              ...
+                              raise $EXC
+                          ...
+                      - pattern-inside: |
+                          if not $V.$CHECK():
+                              ...
+                              return ...
+                          ...
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      regex: ^(isdigit|isdecimal|isnumeric|isalnum|isidentifier)$
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          if $V not in $ALLOWED:
+                              ...
+                              $ABORT(...)
+                          ...
+                      - pattern-inside: |
+                          if not $RX.fullmatch(..., $V):
+                              ...
+                              $ABORT(...)
+                          ...
+                  - metavariable-regex:
+                      metavariable: $ABORT
+                      regex: ^(.*\.)?(abort|exit)$
+              - patterns:
+                  - pattern-inside: |
+                      if not $V.$CHECK():
+                          ...
+                          $ABORT(...)
+                      ...
+                  - metavariable-regex:
+                      metavariable: $CHECK
+                      regex: ^(isdigit|isdecimal|isnumeric|isalnum|isidentifier)$
+                  - metavariable-regex:
+                      metavariable: $ABORT
+                      regex: ^(.*\.)?(abort|exit)$
+          - pattern: $V
+      # Driver escaping and safe query composition. html.escape() and re.escape()
+      # are not SQL escaping and do not count.
+      - &sqli-driver-escape
+        patterns:
+          - pattern-either:
+              - pattern: $CONN.escape(...)
+              - pattern: $CONN.literal(...)
+          - metavariable-regex:
+              metavariable: $CONN
+              regex: ^(?!(html|re|cgi|markupsafe|jinja2|flask|saxutils|xml\.sax\.saxutils|urllib\.parse)$)
+      - &sqli-safe-composition
+        pattern-either:
+          - pattern: $CONN.escape_string(...)
+          - pattern: $CONN.mogrify("...", ...)
+          - pattern: $CONNECTION.ops.quote_name(...)
+          - pattern: pymysql.converters.escape_string(...)
+          - pattern: MySQLdb.escape_string(...)
+          - pattern: psycopg2.extensions.quote_ident(...)
+          - pattern: psycopg2.sql.Identifier(...)
+          - pattern: psycopg2.sql.Literal(...)
+          - pattern: psycopg2.sql.SQL("...").format(...)
+          - pattern: psycopg.sql.Identifier(...)
+          - pattern: psycopg.sql.Literal(...)
+          - pattern: psycopg.sql.SQL("...").format(...)
+          - pattern: sqlalchemy.bindparam(...)
+      - &sqli-escaped-vars
+        patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $V = $CONN.escape_string(...)
+                  ...
+              - pattern-inside: |
+                  $V = $CONNECTION.ops.quote_name(...)
+                  ...
+              - pattern-inside: |
+                  $V = psycopg2.extensions.quote_ident(...)
+                  ...
+              - pattern-inside: |
+                  $V = pymysql.converters.escape_string(...)
+                  ...
+          - pattern: $V
+      # SQLAlchemy Core / ORM statement objects bind their values as parameters:
+      # select(User).where(User.name == name), stmt = stmt.where(...),
+      # insert(users).values(name=name). Textual SQL inside them is still checked.
+      - &sqli-orm-statements
+        patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: $STMT.$METHOD($ARG, ...)
+                      - pattern: $STMT.$METHOD(..., $KW=$ARG, ...)
+                  - metavariable-regex:
+                      metavariable: $METHOD
+                      regex: ^(where|filter|filter_by|values|order_by|group_by|having|returning|select_from|on_conflict_do_update|on_conflict_do_nothing|on_duplicate_key_update)$
+              - patterns:
+                  - pattern: $STMT.$METHOD(...)
+                  - metavariable-regex:
+                      metavariable: $METHOD
+                      regex: ^(join|outerjoin|limit|offset|options|distinct|params|execution_options)$
+                  - metavariable-pattern:
+                      metavariable: $STMT
+                      patterns:
+                        - pattern-either:
+                            - pattern: sqlalchemy.$BUILDER(...)
+                            - pattern: sqlalchemy.sql.$BUILDER(...)
+                            - pattern: sqlalchemy.sql.expression.$BUILDER(...)
+                            - pattern: sqlalchemy.future.$BUILDER(...)
+                            - pattern: sqlalchemy.dialects.$DIALECT.$BUILDER(...)
+                            - pattern: $TABLE.$BUILDER(...)
+                        - metavariable-regex:
+                            metavariable: $BUILDER
+                            regex: ^(select|insert|update|delete|union|union_all|exists)$
+          - pattern-not: $STMT.$METHOD(..., <... sqlalchemy.text(...) ...>, ...)
+          - pattern-not: $STMT.$METHOD(..., <... sqlalchemy.literal_column(...) ...>, ...)
+    pattern-sinks: &sqli-sinks
+      - patterns:
+          - pattern-either:
+              # DB-API 2.0 cursors and connections: sqlite3, psycopg2/3, pymysql,
+              # mysql-connector, MySQLdb; SQLAlchemy Session/Connection/Engine.
+              - patterns:
+                  - pattern-either:
+                      - pattern: $DB.execute($QUERY, ...)
+                      - pattern: $DB.executemany($QUERY, ...)
+                      - pattern: $DB.executescript($QUERY, ...)
+                      - patterns:
+                          - pattern-either:
+                              - pattern: $DB.execute(..., $KW=$QUERY, ...)
+                              - pattern: $DB.executemany(..., $KW=$QUERY, ...)
+                          - metavariable-regex:
+                              metavariable: $KW
+                              regex: ^(query|operation|sql|statement)$
+                  # GraphQL schemas also have .execute(); their input is not SQL.
+                  - metavariable-regex:
+                      metavariable: $DB
+                      regex: ^(?![\w.]*(?i:schema|graphql))
+              # Django: Model.objects.raw(), QuerySet.extra(), RawSQL().
+              - pattern: $MODEL.$MANAGER.raw($QUERY, ...)
+              - patterns:
+                  - pattern: $QS.extra(..., $KW=$QUERY, ...)
+                  - metavariable-regex:
+                      metavariable: $KW
+                      regex: ^(select|where|tables|order_by)$
+              - pattern: RawSQL($QUERY, ...)
+              - pattern: django.db.models.expressions.RawSQL($QUERY, ...)
+              # SQLAlchemy textual SQL.
+              - pattern: sqlalchemy.text($QUERY, ...)
+              - pattern: sqlalchemy.sql.text($QUERY, ...)
+              - pattern: sqlalchemy.sql.expression.text($QUERY, ...)
+              - pattern: sqlalchemy.literal_column($QUERY, ...)
+              - pattern: sqlalchemy.sql.expression.literal_column($QUERY, ...)
+              # pandas runs the query string as-is.
+              - pattern: pandas.read_sql($QUERY, ...)
+              - pattern: pandas.read_sql_query($QUERY, ...)
+          - focus-metavariable: $QUERY
+
+  - id: py-sqli-dynamic-query
+    languages: [python]
+    severity: WARNING
+    message: >-
+      This SQL statement is assembled from a runtime value with an f-string, %, format()
+      or string concatenation. If that value can come from a user, they can rewrite the
+      query. Keep the SQL text constant and pass values as bound parameters; map
+      identifiers such as table or column names through a fixed allowlist.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Query_Parameterization_Cheat_Sheet.html
+        - https://docs.python.org/3/library/sqlite3.html#sqlite3-placeholders
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources:
+      # The non-constant part of a string built with an f-string, %, str.format(),
+      # + or str.join([...]). Constants, placeholder lists and fragments that are
+      # themselves joined from pieces (checked where each piece is built) are skipped.
+      - &built-string-operand
+        patterns:
+          - patterns:
+              - pattern-either:
+                  - pattern: f"...{$X}..."
+                  - patterns:
+                      - pattern: f"...{$X:...}..."
+                      - metavariable-regex:
+                          metavariable: $X
+                          regex: ^[^{]
+                  - patterns:
+                      - pattern: '"..." % $X'
+                      - metavariable-regex:
+                          metavariable: $X
+                          regex: ^[^(]
+                  - pattern: '"..." % (..., $X, ...)'
+                  - pattern: '"..." % {..., $KEY: $X, ...}'
+                  - pattern: '"...".format(..., $X, ...)'
+                  - pattern: '"...".format(..., $KEY=$X, ...)'
+                  - pattern: '"..." + $X'
+                  - patterns:
+                      - pattern: $LEFT + $X
+                      - metavariable-pattern:
+                          metavariable: $LEFT
+                          pattern: '"..."'
+                  - pattern: '"...".join([..., $X, ...])'
+                  - pattern: '"...".join((..., $X, ...))'
+                  # query = "SELECT ..."; query += value
+                  - patterns:
+                      - pattern-inside: |
+                          $VAR = "..."
+                          ...
+                      - pattern: $VAR += $X
+              - focus-metavariable: $X
+          - pattern-not: '"..."'
+          - pattern-not: '"...".join(...)'
+          - pattern-not: $MODEL._meta.$ATTR
+          - pattern-not: $MODEL.__tablename__
+          # Variables that hold placeholder lists such as "?, ?, ?".
+          - pattern-not-inside: |
+              $X = "...".join(...)
+              ...
+          - pattern-not-inside: |
+              $X = "..." * $COUNT
+              ...
+          # ALL_CAPS constants, lookups in constant maps, and numeric literals.
+          - metavariable-regex:
+              metavariable: $X
+              regex: ^(?!((?!(.*\.)?(GET|POST|COOKIES|META|FILES)\b)([\w.]+\.)?[A-Z][A-Z0-9_]*|-?\d[\d_.]*)$)
+    pattern-sanitizers: *sqli-sanitizers
+    pattern-sinks: *sqli-sinks
+
+  - id: py-sqli-local-tainted
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Command-line or console input (sys.argv, input(), argparse) is placed into a raw SQL
+      statement. Whoever runs this program can rewrite the query, which matters when it
+      runs with database rights the caller should not have. Pass values as bound
+      parameters instead of formatting them into the SQL text.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: LOW
+      likelihood: LOW
+      impact: HIGH
+      security-severity: "5.3"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Query_Parameterization_Cheat_Sheet.html
+        - https://docs.python.org/3/library/sqlite3.html#sqlite3-placeholders
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources: &local-sources
+      - pattern: sys.argv
+      - pattern: sys.stdin
+      - pattern: input(...)
+      - pattern: raw_input(...)
+      - pattern: fileinput.input(...)
+      - patterns:
+          - pattern: $PARSER.$PARSE(...)
+          - metavariable-regex:
+              metavariable: $PARSE
+              regex: ^parse_(known_)?(intermixed_)?args$
+    pattern-sanitizers:
+      - *sanitize-casts
+      - *sanitize-validated-vars
+      - *sanitize-guards
+      - *sqli-driver-escape
+      - *sqli-safe-composition
+      - *sqli-escaped-vars
+      - *sqli-orm-statements
+      # A file named on the command line holds a script the caller chose to run
+      # (a SQL migration, a Python file for a profiler); its contents are not
+      # treated as injected input.
+      - &sanitize-file-contents
+        pattern-either:
+          - pattern: open(...)
+          - pattern: io.open(...)
+          - pattern: io.open_code(...)
+          - pattern: tokenize.open(...)
+          - pattern: $PATH.read_text(...)
+          - pattern: $PATH.read_bytes(...)
+    pattern-sinks: *sqli-sinks
+
+  # =========================================================================
+  # OS command injection (CWE-78)
+  # =========================================================================
+  - id: py-command-injection-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Data from the HTTP request reaches a shell command or chooses the program that is
+      run. An attacker can execute arbitrary commands on the server with shell
+      metacharacters such as ; | $() or by naming their own program. Call subprocess with
+      a list of arguments and shell=False, keep the program name constant, and quote
+      unavoidable shell arguments with shlex.quote().
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.8"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+        - https://docs.python.org/3/library/subprocess.html#security-considerations
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources: *web-sources
+    pattern-sanitizers: &cmd-sanitizers
+      - *sanitize-casts
+      - *sanitize-validated-vars
+      - *sanitize-guards
+      - &shell-quote
+        pattern-either:
+          - pattern: shlex.quote(...)
+          - pattern: pipes.quote(...)
+          - pattern: shlex.join(...)
+      - &shell-quoted-vars
+        patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $V = shlex.quote(...)
+                  ...
+              - pattern-inside: |
+                  $V = pipes.quote(...)
+                  ...
+              - pattern-inside: |
+                  $V = shlex.join(...)
+                  ...
+          - pattern: $V
+    pattern-sinks: &cmd-sinks
+      # A string that a shell will parse.
+      - &shell-sinks
+        patterns:
+          - pattern-either:
+              - pattern: os.system($CMD)
+              - patterns:
+                  - pattern: os.$POPEN($CMD, ...)
+                  - metavariable-regex:
+                      metavariable: $POPEN
+                      regex: ^popen[234]?$
+              - pattern: commands.getoutput($CMD)
+              - pattern: commands.getstatusoutput($CMD)
+              - pattern: subprocess.getoutput($CMD, ...)
+              - pattern: subprocess.getstatusoutput($CMD, ...)
+              - pattern: asyncio.create_subprocess_shell($CMD, ...)
+              - pattern: $LOOP.subprocess_shell($FACTORY, $CMD, ...)
+              - patterns:
+                  - pattern-either:
+                      - patterns:
+                          - pattern: subprocess.$FN($CMD, ..., shell=True, ...)
+                          - pattern-not: subprocess.$FN([...], ...)
+                          - pattern-not: subprocess.$FN(($ITEM, ...), ...)
+                      - pattern: subprocess.$FN(..., args=$CMD, ..., shell=True, ...)
+                      # With shell=True only the first list item is parsed by the shell.
+                      - pattern: subprocess.$FN([$CMD, ...], ..., shell=True, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(run|call|check_call|check_output|Popen)$
+              # An explicit shell with a command string: ["bash", "-c", cmd].
+              - patterns:
+                  - pattern-either:
+                      - pattern: subprocess.$FN([$SHELL, ..., $FLAG, $CMD, ...], ...)
+                      - pattern: asyncio.create_subprocess_exec($SHELL, ..., $FLAG, $CMD, ...)
+                      - pattern: os.$FN($SHELL, ..., $FLAG, $CMD, ...)
+                      - pattern: os.$FN($SHELL, [..., $FLAG, $CMD, ...], ...)
+                      - pattern: os.$FN($MODE, $SHELL, ..., $FLAG, $CMD, ...)
+                      - pattern: os.$FN($MODE, $SHELL, [..., $FLAG, $CMD, ...], ...)
+                      - pattern: pty.spawn([$SHELL, ..., $FLAG, $CMD, ...], ...)
+                  - metavariable-regex:
+                      metavariable: $SHELL
+                      regex: ^['"]?(/usr)?(/local)?(/bin/)?((ba|da|z|k|c|tc)?sh|cmd(\.exe)?|powershell(\.exe)?|pwsh)['"]?$
+                  - metavariable-regex:
+                      metavariable: $FLAG
+                      regex: ^['"]?(-[a-zA-Z]*c|/[cCkK]|-Command)['"]?$
+          - focus-metavariable: $CMD
+      # The program to execute, or the whole argument vector, is chosen at runtime.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: subprocess.$FN([$PROG, ...], ...)
+                      - patterns:
+                          - pattern: subprocess.$FN($PROG, ...)
+                          - pattern-not: subprocess.$FN([...], ...)
+                          - pattern-not: subprocess.$FN(($ITEM, ...), ...)
+                          - pattern-not: subprocess.$FN(["...", ...] + $MORE, ...)
+                          # argv = ["git", "log", ref] keeps the program fixed.
+                          - pattern-not-inside: |
+                              $PROG = ["...", ...]
+                              ...
+                          - pattern-not-inside: |
+                              $PROG = ["...", ...] + $MORE
+                              ...
+                          - pattern-not-inside: |
+                              $PROG = [sys.executable, ...]
+                              ...
+                          - pattern-not-inside: |
+                              $PROG = [shutil.which("..."), ...]
+                              ...
+                          - pattern-not-inside: |
+                              $BASE = ["...", ...]
+                              ...
+                              $PROG = $BASE + $MORE
+                              ...
+                  - pattern-not: subprocess.$FN(..., shell=True, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(run|call|check_call|check_output|Popen)$
+              - patterns:
+                  - pattern: os.$FN($PROG, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(exec(l|le|lp|lpe|v|ve|vp|vpe)|posix_spawnp?)$
+              - patterns:
+                  - pattern: os.$FN($MODE, $PROG, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^spawn(l|le|lp|lpe|v|ve|vp|vpe)$
+              - pattern: asyncio.create_subprocess_exec($PROG, ...)
+              - pattern: pty.spawn([$PROG, ...], ...)
+              - patterns:
+                  - pattern: pty.spawn($PROG, ...)
+                  - pattern-not: pty.spawn([...], ...)
+          - focus-metavariable: $PROG
+
+  - id: py-command-injection-dynamic-shell
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A shell command is assembled from a runtime value with an f-string, %, format(),
+      concatenation or join and then run through a shell (os.system, os.popen,
+      shell=True, sh -c). If that value can come from a user, shell metacharacters in it
+      run extra commands. Pass an argument list to subprocess without shell=True, or
+      quote each value with shlex.quote().
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+        - https://docs.python.org/3/library/subprocess.html#security-considerations
+        - https://docs.python.org/3/library/shlex.html#shlex.quote
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources:
+      - *built-string-operand
+    pattern-sanitizers: *cmd-sanitizers
+    pattern-sinks:
+      - *shell-sinks
+
+  - id: py-command-injection-local-tainted
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Command-line or console input (sys.argv, input(), argparse) reaches a shell command
+      or chooses the program that is run. This is exploitable when the script runs with
+      more privilege than its caller (setuid, sudo rules, CI jobs, cron wrappers). Use an
+      argument list without shell=True and keep the program name constant.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: LOW
+      likelihood: LOW
+      impact: HIGH
+      security-severity: "5.3"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+        - https://docs.python.org/3/library/subprocess.html#security-considerations
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources: *local-sources
+    pattern-sanitizers:
+      - *sanitize-casts
+      - *sanitize-validated-vars
+      - *sanitize-guards
+      - *shell-quote
+      - *shell-quoted-vars
+      - *sanitize-file-contents
+    pattern-sinks: *cmd-sinks
+
+  # =========================================================================
+  # Code injection: eval / exec / compile / dynamic import (CWE-94)
+  # =========================================================================
+  - id: py-code-injection-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Data from the HTTP request is executed as Python code (eval, exec, compile) or
+      picks the module to import or run. An attacker can run arbitrary code in the server
+      process; restricted globals such as {"__builtins__": {}} do not prevent this. Parse
+      data with json.loads() or ast.literal_eval(), and map user choices to code through
+      a fixed dictionary.
+    metadata:
+      cwe: "CWE-94: Improper Control of Generation of Code ('Code Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.8"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://owasp.org/www-community/attacks/Code_Injection
+        - https://docs.python.org/3/library/ast.html#ast.literal_eval
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources: *web-sources
+    pattern-sanitizers:
+      - *sanitize-casts
+      - *sanitize-validated-vars
+      - *sanitize-guards
+    pattern-sinks:
+      - &eval-sinks
+        patterns:
+          - pattern-either:
+              - pattern: eval($CODE, ...)
+              - pattern: exec($CODE, ...)
+              - pattern: builtins.eval($CODE, ...)
+              - pattern: builtins.exec($CODE, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern: compile($CODE, $FILENAME, $MODE, ...)
+                      - pattern: builtins.compile($CODE, $FILENAME, $MODE, ...)
+                  # compile(..., ast.PyCF_ONLY_AST) only parses, like ast.parse().
+                  - pattern-not: $COMPILE($CODE, $FILENAME, $MODE, <... $AST.PyCF_ONLY_AST ...>, ...)
+                  - pattern-not: $COMPILE(..., flags=<... $AST.PyCF_ONLY_AST ...>, ...)
+          - focus-metavariable: $CODE
+      # Choosing the module to import or run.
+      - patterns:
+          - pattern-either:
+              - pattern: __import__($CODE, ...)
+              - pattern: importlib.import_module($CODE, ...)
+              - pattern: importlib.__import__($CODE, ...)
+              - pattern: runpy.run_module($CODE, ...)
+              - pattern: runpy.run_path($CODE, ...)
+          - focus-metavariable: $CODE
+
+  - id: py-code-injection-dynamic-eval
+    languages: [python]
+    severity: WARNING
+    message: >-
+      eval(), exec() or compile() runs a value that is not a constant string. If any part
+      of it can come from a user, they can run arbitrary Python code in this process.
+      Parse data with json.loads() or ast.literal_eval() instead, or dispatch to a fixed
+      set of functions.
+    metadata:
+      cwe: "CWE-94: Improper Control of Generation of Code ('Code Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://owasp.org/www-community/attacks/Code_Injection
+        - https://docs.python.org/3/library/functions.html#eval
+        - https://docs.python.org/3/library/ast.html#ast.literal_eval
+    patterns:
+      - pattern-either:
+          - pattern: eval($CODE, ...)
+          - pattern: exec($CODE, ...)
+          - pattern: builtins.eval($CODE, ...)
+          - pattern: builtins.exec($CODE, ...)
+          - pattern: compile($CODE, $FILENAME, $MODE, ...)
+          - pattern: builtins.compile($CODE, $FILENAME, $MODE, ...)
+      # Constant source text, and code objects that compile() already produced.
+      - pattern-not: $RUN("...", ...)
+      - pattern-not: $RUN(textwrap.dedent("..."), ...)
+      - pattern-not: $RUN(compile(...), ...)
+      - pattern-not-inside: |
+          $CODE = compile(...)
+          ...
+      # compile(..., ast.PyCF_ONLY_AST) only parses, like ast.parse().
+      - pattern-not: $RUN($CODE, $FILENAME, $MODE, <... $AST.PyCF_ONLY_AST ...>, ...)
+      - pattern-not: $RUN(..., flags=<... $AST.PyCF_ONLY_AST ...>, ...)
+      # Reading a fixed file shipped with the project (setup.py version files).
+      - pattern-not: $RUN(open("...", ...).read(), ...)
+      - pattern-not: $RUN(pathlib.Path("...").read_text(...), ...)
+      - pattern-not-inside: |
+          with open("...", ...) as $FILE:
+              ...
+              $RUN($FILE.read(), ...)
+      - metavariable-regex:
+          metavariable: $CODE
+          regex: ^(?!([\w.]+\.)?[A-Z][A-Z0-9_]*$)
+
+  - id: py-code-injection-local-tainted
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Command-line or console input (sys.argv, input(), argparse) is executed as Python
+      code with eval(), exec() or compile(). This is exploitable when the script runs
+      with more privilege than its caller. Parse the input with ast.literal_eval() or
+      json.loads(), or map it to a fixed set of functions.
+    metadata:
+      cwe: "CWE-94: Improper Control of Generation of Code ('Code Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: LOW
+      likelihood: LOW
+      impact: HIGH
+      security-severity: "5.3"
+      references:
+        - https://owasp.org/www-community/attacks/Code_Injection
+        - https://docs.python.org/3/library/ast.html#ast.literal_eval
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources: *local-sources
+    pattern-sanitizers:
+      - *sanitize-casts
+      - *sanitize-validated-vars
+      - *sanitize-guards
+      - *sanitize-file-contents
+    # Importing or running a module named on the command line is what tools such
+    # as `python -m` wrappers are for, so only eval/exec/compile are sinks here.
+    pattern-sinks:
+      - *eval-sinks
+
+  # =========================================================================
+  # LDAP injection (CWE-90)
+  # =========================================================================
+  - id: py-ldap-injection-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Data from the HTTP request is placed into an LDAP search filter or base DN without
+      escaping. Characters such as * ( ) \ let an attacker widen the search, bypass a
+      login check or read other directory entries. Escape values with
+      ldap.filter.escape_filter_chars() / filter_format() (ldap3:
+      escape_filter_chars()) and DN parts with ldap.dn.escape_dn_chars().
+    metadata:
+      cwe: "CWE-90: Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/LDAP_Injection_Prevention_Cheat_Sheet.html
+        - https://www.python-ldap.org/en/latest/reference/ldap-filter.html
+        - https://ldap3.readthedocs.io/en/latest/searches.html
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources: *web-sources
+    pattern-sanitizers: &ldap-sanitizers
+      - *sanitize-casts
+      - *sanitize-validated-vars
+      - *sanitize-guards
+      - pattern-either:
+          - pattern: ldap.filter.escape_filter_chars(...)
+          - pattern: ldap.filter.filter_format(...)
+          - pattern: ldap.dn.escape_dn_chars(...)
+          - pattern: ldap3.utils.conv.escape_filter_chars(...)
+          - pattern: ldap3.utils.dn.escape_rdn(...)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $V = ldap.filter.escape_filter_chars(...)
+                  ...
+              - pattern-inside: |
+                  $V = ldap.filter.filter_format(...)
+                  ...
+              - pattern-inside: |
+                  $V = ldap.dn.escape_dn_chars(...)
+                  ...
+              - pattern-inside: |
+                  $V = ldap3.utils.conv.escape_filter_chars(...)
+                  ...
+              - pattern-inside: |
+                  $V = ldap3.utils.dn.escape_rdn(...)
+                  ...
+          - pattern: $V
+    pattern-sinks: &ldap-sinks
+      - patterns:
+          - pattern-either:
+              # python-ldap: search_s(base, scope, filterstr, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern: $LDAP.$SEARCH($BASE, $SCOPE, $FILTER, ...)
+                      - pattern: $LDAP.$SEARCH($BASE, $SCOPE, ..., filterstr=$FILTER, ...)
+                  - metavariable-regex:
+                      metavariable: $SEARCH
+                      regex: ^search_(s|st|ext|ext_s)$
+              - patterns:
+                  - pattern-either:
+                      - pattern: $LDAP.search($BASE, $SCOPE, $FILTER, ...)
+                      - pattern: $LDAP.search($BASE, $SCOPE, ..., filterstr=$FILTER, ...)
+                  - metavariable-regex:
+                      metavariable: $SCOPE
+                      regex: .*SCOPE_
+              # ldap3: Connection.search(search_base, search_filter, search_scope, ...)
+              - pattern: $CONN.search(..., search_filter=$FILTER, ...)
+              - pattern: $CONN.search($BASE, $FILTER, ..., search_scope=$SCOPE, ...)
+              - pattern: $CONN.search($BASE, $FILTER, ..., attributes=$ATTRS, ...)
+              - patterns:
+                  - pattern: $CONN.search($BASE, $FILTER, $SCOPE, ...)
+                  - metavariable-regex:
+                      metavariable: $SCOPE
+                      regex: ^(.*\.)?(SUBTREE|LEVEL|BASE)$
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $CONN = ldap3.Connection(...)
+                          ...
+                      - pattern-inside: |
+                          with ldap3.Connection(...) as $CONN:
+                              ...
+                  - pattern: $CONN.search($BASE, $FILTER, ...)
+              - pattern: $CONN.extend.standard.paged_search($BASE, $FILTER, ...)
+              - pattern: $CONN.extend.standard.paged_search(..., search_filter=$FILTER, ...)
+          - focus-metavariable: $FILTER
+      # The search base DN is injectable too: f"uid={user},ou=people,...".
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: $LDAP.$SEARCH($BASE, $SCOPE, ...)
+                  - metavariable-regex:
+                      metavariable: $SEARCH
+                      regex: ^search_(s|st|ext|ext_s)$
+              - pattern: $CONN.search(..., search_base=$BASE, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $CONN = ldap3.Connection(...)
+                          ...
+                      - pattern-inside: |
+                          with ldap3.Connection(...) as $CONN:
+                              ...
+                  - pattern: $CONN.search($BASE, ...)
+          - focus-metavariable: $BASE
+
+  - id: py-ldap-injection-dynamic-filter
+    languages: [python]
+    severity: WARNING
+    message: >-
+      An LDAP search filter or base DN is assembled from a runtime value with an
+      f-string, %, format() or concatenation. If that value can come from a user,
+      characters such as * ( ) \ change the meaning of the search. Escape each value with
+      ldap.filter.escape_filter_chars() or build the filter with
+      ldap.filter.filter_format() (ldap3: escape_filter_chars()).
+    metadata:
+      cwe: "CWE-90: Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "6.5"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/LDAP_Injection_Prevention_Cheat_Sheet.html
+        - https://www.python-ldap.org/en/latest/reference/ldap-filter.html
+    mode: taint
+    options: *taint-options
+    pattern-propagators: *list-propagators
+    pattern-sources:
+      - *built-string-operand
+    pattern-sanitizers: *ldap-sanitizers
+    pattern-sinks: *ldap-sinks

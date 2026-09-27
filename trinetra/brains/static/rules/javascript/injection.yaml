@@ -1,0 +1,1232 @@
+# Trinetra static brain: JavaScript / TypeScript injection rules.
+#
+# Families: SQL injection, OS command injection, code injection (eval & co.),
+# NoSQL (MongoDB) injection, server-side template injection, insecure
+# deserialization.
+#
+# Each injection class has two rules:
+#   *-tainted  taint mode, sources are real HTTP input (Express, Koa, Fastify,
+#              Hapi, Next.js pages and app router, NestJS, AWS Lambda). HIGH.
+#   *-dynamic  the sink receives a dynamically built string (concatenation,
+#              template literal, .concat, join, util.format) or, for shell and
+#              eval sinks, a function parameter. Source unknown. MEDIUM.
+#
+# YAML anchors (&name / *name) share sources, sinks and sanitizers between rules.
+
+rules:
+  # ---------------------------------------------------------------------------
+  # SQL injection
+  # ---------------------------------------------------------------------------
+  - id: js-sqli-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      User input from an HTTP request is built into the text of a SQL query. An
+      attacker can rewrite the query to read, change or delete any data (SQL
+      injection). Pass values as bound parameters instead: `?` or numbered
+      placeholders with a values array, Sequelize `replacements`, or TypeORM
+      `:name` parameters.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [express, koa, fastify, nextjs, nestjs, mysql, pg, sequelize, knex, typeorm, prisma]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.1"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+    mode: taint
+    options: &taint_options
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: &user_input
+      # Express, Next.js pages API, Fastify, Hapi and Koa request objects.
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.rawBody
+              - pattern: $REQ.cookies
+              - pattern: $REQ.signedCookies
+              - pattern: $REQ.headers
+              - pattern: $REQ.payload
+              - pattern: $REQ.files
+              - pattern: $REQ.file
+              - pattern: $REQ.url
+              - pattern: $REQ.originalUrl
+              - pattern: $REQ.path
+              - pattern: $REQ.querystring
+              - pattern: $REQ.hostname
+              - pattern: $REQ.nextUrl
+              - pattern: $REQ.get(...)
+              - pattern: $REQ.header(...)
+              - pattern: $REQ.param(...)
+              - pattern: $REQ.json()
+              - pattern: $REQ.formData()
+              - pattern: $REQ.text()
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|_req|request|ctx\.request|ctx\.req|context\.req)$
+      # Koa context shortcuts (ctx.body is the response, so it is not a source).
+      - patterns:
+          - pattern-either:
+              - pattern: $CTX.query
+              - pattern: $CTX.params
+              - pattern: $CTX.querystring
+              - pattern: $CTX.headers
+              - pattern: $CTX.url
+              - pattern: $CTX.path
+              - pattern: $CTX.cookies
+              - pattern: $CTX.get(...)
+          - metavariable-regex:
+              metavariable: $CTX
+              regex: ^ctx$
+      # AWS Lambda / API Gateway events.
+      - patterns:
+          - pattern-either:
+              - pattern: $EVT.body
+              - pattern: $EVT.queryStringParameters
+              - pattern: $EVT.multiValueQueryStringParameters
+              - pattern: $EVT.pathParameters
+              - pattern: $EVT.headers
+          - metavariable-regex:
+              metavariable: $EVT
+              regex: ^(event|evt)$
+      # NestJS controller parameters (@Body(), @Query(), @Param(), ...).
+      - patterns:
+          - pattern-inside: |
+              function $FUNC(..., @$DECORATOR(...) $PARAM, ...) { ... }
+          - focus-metavariable: $PARAM
+          - metavariable-regex:
+              metavariable: $DECORATOR
+              regex: ^(Body|Query|Param|Headers|Req|Request|Cookies|UploadedFile|UploadedFiles)$
+      # Next.js app router dynamic segments: GET(request, { params }) / GET(request, context)
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          function $METHOD($ROUTEREQ, { params }: $CTXTYPE) { ... }
+                      - pattern-inside: |
+                          function $METHOD($ROUTEREQ, { params }) { ... }
+                  - pattern: params
+              - patterns:
+                  - pattern-inside: |
+                      function $METHOD($ROUTEREQ, $ROUTECTX) { ... }
+                  - pattern: $ROUTECTX.params
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$
+    pattern-sanitizers: &sql_sanitizers
+      - pattern-either:
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: Number.parseInt(...)
+          - pattern: Number.parseFloat(...)
+          - pattern: BigInt(...)
+          - pattern: Math.$MATHFN(...)
+          # allowlist: ALLOWED.includes(x) ? x : 'default'
+          - pattern: '$ALLOW.includes($V) ? $V : $DEFAULT'
+          - pattern: '$ALLOW.has($V) ? $V : $DEFAULT'
+          # placeholder lists: ids.map(() => '?').join(', ')
+          - pattern: $ARR.map((...) => "...").join(...)
+          - pattern: $ARR.map((...) => `$${...}`).join(...)
+          # tagged templates (slonik sql`...`, mssql sql.query`...`, Prisma.sql`...`)
+          # send interpolations as bound parameters
+          - pattern: $TAG`...`
+      # driver escaping: mysql.escape, connection.escapeId, SqlString.format,
+      # pg client.escapeLiteral / escapeIdentifier, pg-format
+      - patterns:
+          - pattern-either:
+              - pattern: $ESC.escape(...)
+              - pattern: $ESC.escapeId(...)
+              - pattern: $ESC.escapeLiteral(...)
+              - pattern: $ESC.escapeIdentifier(...)
+              - pattern: $ESC.format(...)
+          # metavariable-regex is anchored at the start, hence the (.*\.)? prefix
+          - metavariable-regex:
+              metavariable: $ESC
+              regex: (?i)^(.*\.)?(mysql2?|sqlstring|connection|conn|con|pool|db|client|pg|pgClient)$
+      # pg-format: format('... %L', value)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $PGF = require('pg-format')
+                  ...
+              - pattern-inside: |
+                  import $PGF from 'pg-format'
+                  ...
+          - pattern: $PGF(...)
+      - patterns:
+          - pattern-either:
+              - pattern: $PGF.literal(...)
+              - pattern: $PGF.ident(...)
+          - metavariable-regex:
+              metavariable: $PGF
+              regex: (?i)^(pg_?)?format$
+    pattern-sinks: &sql_sinks
+      # mysql, mysql2, pg, mssql, Sequelize, TypeORM DataSource / EntityManager /
+      # QueryRunner / Repository .query(), mysql2 / oracledb .execute(), Prisma *Unsafe.
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.query($SQL, ...)
+              - pattern: $DB.$queryRawUnsafe($SQL, ...)
+              - pattern: $DB.$executeRawUnsafe($SQL, ...)
+              # .execute() is also the command/use-case pattern (CQRS buses), so
+              # only database-like receivers count
+              - patterns:
+                  - pattern: $DB.execute($SQL, ...)
+                  - metavariable-regex:
+                      metavariable: $DB
+                      regex: (?i)^.*(conn|pool|db|database|mysql|maria|sql|oracle|cassandra|client|\btx|trx|transaction)
+                  - pattern-not: $DB.execute(new $COMMAND(...), ...)
+          # config-object form is handled below; GraphQL clients use it too
+          - pattern-not: $ANYDB.$ANYFN({...}, ...)
+          # superagent / supertest: request.get(url).query({...}) sets a query string
+          - pattern-not: $HTTP.get(...).query(...)
+          - pattern-not: $HTTP.post(...).query(...)
+          - pattern-not: $HTTP.put(...).query(...)
+          - pattern-not: $HTTP.patch(...).query(...)
+          - pattern-not: $HTTP.delete(...).query(...)
+          - focus-metavariable: $SQL
+      # postgres.js sql.unsafe(query); better-sqlite3 / sqlite3 db.prepare(sql), db.exec(sql)
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.unsafe($SQL, ...)
+              - pattern: $DB.prepare($SQL, ...)
+              - pattern: $DB.exec($SQL, ...)
+          - metavariable-regex:
+              metavariable: $DB
+              regex: (?i)^(.*\.)?\w*(sql|pg|postgres|db|database|sqlite|conn|connection)$
+          - pattern-not: $ANYDB.$ANYFN({...}, ...)
+          - focus-metavariable: $SQL
+      # mysql `query({ sql, values })`, pg `query({ text, values })`
+      - patterns:
+          - pattern-either:
+              - pattern: '$DB.query({..., sql: $SQL, ...}, ...)'
+              - pattern: '$DB.query({..., text: $SQL, ...}, ...)'
+              - pattern: '$DB.execute({..., sql: $SQL, ...}, ...)'
+          - focus-metavariable: $SQL
+      # knex raw fragments
+      - patterns:
+          - pattern-either:
+              - pattern: $KNEX.raw($SQL, ...)
+              - pattern: $KNEX.whereRaw($SQL, ...)
+              - pattern: $KNEX.orWhereRaw($SQL, ...)
+              - pattern: $KNEX.andWhereRaw($SQL, ...)
+              - pattern: $KNEX.havingRaw($SQL, ...)
+              - pattern: $KNEX.orHavingRaw($SQL, ...)
+              - pattern: $KNEX.orderByRaw($SQL, ...)
+              - pattern: $KNEX.groupByRaw($SQL, ...)
+              - pattern: $KNEX.joinRaw($SQL, ...)
+              - pattern: $KNEX.fromRaw($SQL, ...)
+          - pattern-not: String.raw(...)
+          # express.raw({ limit }) / bodyParser.raw({ type }) are body parsers
+          - pattern-not: $ANYKNEX.$ANYFN({...}, ...)
+          - focus-metavariable: $SQL
+      # sequelize.literal(...)
+      - patterns:
+          - pattern: $SEQ.literal($SQL)
+          - metavariable-regex:
+              metavariable: $SEQ
+              regex: (?i)^(.*\.)?sequelize$
+          - focus-metavariable: $SQL
+      # TypeORM QueryBuilder string conditions
+      - patterns:
+          - pattern-either:
+              # inline chain: repo.createQueryBuilder('u').where(...)
+              - patterns:
+                  - pattern-either: &typeorm_string_methods
+                      - pattern: $QB.where($SQL, ...)
+                      - pattern: $QB.andWhere($SQL, ...)
+                      - pattern: $QB.orWhere($SQL, ...)
+                      - pattern: $QB.having($SQL, ...)
+                      - pattern: $QB.andHaving($SQL, ...)
+                      - pattern: $QB.orHaving($SQL, ...)
+                      - pattern: $QB.orderBy($SQL, ...)
+                      - pattern: $QB.addOrderBy($SQL, ...)
+                      - pattern: $QB.groupBy($SQL, ...)
+                      - pattern: $QB.addGroupBy($SQL, ...)
+                      - pattern: $QB.select($SQL, ...)
+                      - pattern: $QB.addSelect($SQL, ...)
+                  - metavariable-pattern:
+                      metavariable: $QB
+                      pattern: <... $ANY.createQueryBuilder(...) ...>
+              # builder stored in a variable: const qb = repo.createQueryBuilder('u')
+              - patterns:
+                  - pattern-inside: |
+                      $QBVAR = <... $ANY.createQueryBuilder(...) ...>;
+                      ...
+                  - pattern-either: *typeorm_string_methods
+                  - metavariable-pattern:
+                      metavariable: $QB
+                      pattern: <... $QBVAR ...>
+          - pattern-not: $ANYQB.$ANYFN({...}, ...)
+          - pattern-not: $ANYQB.$ANYFN([...], ...)
+          - pattern-not: $ANYQB.$ANYFN(new $BRACKETS(...), ...)
+          - focus-metavariable: $SQL
+
+  - id: js-sqli-dynamic
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A SQL query is built by concatenating or interpolating a non-constant
+      value into the query text. If any part of that value can come from a
+      user, the query is open to SQL injection. Use placeholders with a separate
+      values array (or your ORM's parameter binding), and check identifiers such
+      as column names against an allowlist.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [mysql, pg, sequelize, knex, typeorm, prisma]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+    mode: taint
+    options: *taint_options
+    pattern-sources:
+      - patterns:
+          - pattern-either: &dynamic_string
+              - pattern: '"..." + $X'
+              - pattern: '$X + "..."'
+              # "a" + b + c: c is appended to a string that is already being built
+              - patterns:
+                  - pattern: $LEFT + $X
+                  - metavariable-pattern:
+                      metavariable: $LEFT
+                      pattern-either:
+                        - pattern: '"..." + $LEFTVAL'
+                        - pattern: '$LEFTVAL + "..."'
+              - pattern: '`...${$X}...`'
+              - pattern: '"...".concat(..., $X, ...)'
+              - pattern: '[..., $X, ...].join(...)'
+              - pattern: util.format("...", ..., $X, ...)
+              - pattern: sprintf("...", ..., $X, ...)
+          # tagged templates (sql`...`, Prisma.sql`...`) are parameterized
+          - pattern-not-inside: $TAG`...`
+          # the interpolated variable was produced by a cast, allowlist or
+          # placeholder builder earlier in the function
+          - pattern-not-inside: |
+              $X = parseInt(...);
+              ...
+          - pattern-not-inside: |
+              $X = parseInt(...) || $DEFAULTNUM;
+              ...
+          - pattern-not-inside: |
+              $X = Number(...);
+              ...
+          - pattern-not-inside: |
+              $X = Number(...) || $DEFAULTNUM;
+              ...
+          - pattern-not-inside: |
+              $X = Math.$MATHFN(...);
+              ...
+          - pattern-not-inside: |
+              $X = $ALLOW.includes(...) ? $A : $B;
+              ...
+          - pattern-not-inside: |
+              $X = $ALLOW.has(...) ? $A : $B;
+              ...
+          - pattern-not-inside: |
+              $X = $ARR.map((...) => "...").join(...);
+              ...
+          - pattern-not-inside: |
+              $X = $ARR.map((...) => `$${...}`).join(...);
+              ...
+          - pattern-not-inside: |
+              $X = $ESC.escape(...);
+              ...
+          - metavariable-pattern:
+              metavariable: $X
+              patterns:
+                - pattern-not: '"..."'
+                - pattern-not: '"..." + $Y'
+                - pattern-not: '$Y + "..."'
+                - pattern-not: '($Y : number)'
+                - pattern-not: '($Y : boolean)'
+                - pattern-not: parseInt(...)
+                - pattern-not: parseFloat(...)
+                - pattern-not: Number(...)
+                - pattern-not: Math.$MATHFN(...)
+                - pattern-not: $ARR.length
+                - pattern-not: $ESC.escape(...)
+                - pattern-not: $ESC.escapeId(...)
+                - pattern-not: $ESC.escapeLiteral(...)
+                - pattern-not: $ESC.escapeIdentifier(...)
+                - pattern-not: $ARR.map((...) => "...").join(...)
+                - pattern-not: $ARR.map((...) => `$${...}`).join(...)
+                - pattern-not: $ARR.fill("...").join(...)
+                - pattern-not: '"...".repeat(...)'
+                # numeric literals, CONSTANT_CASE names, index arithmetic, placeholder lists
+                - pattern-not-regex: ^[0-9][0-9_.]*$
+                - pattern-not-regex: ^[A-Z][A-Z0-9_]*(\.[A-Za-z0-9_]+)*$
+                - pattern-not-regex: ^\(?\s*[A-Za-z_$][\w$]*\s*[+-]\s*\d+\s*\)?$
+                - pattern-not-regex: (?i)^[\w$.]*(placeholders?|bindings|marks)$
+    pattern-sanitizers: *sql_sanitizers
+    pattern-sinks: *sql_sinks
+
+  # ---------------------------------------------------------------------------
+  # OS command injection
+  # ---------------------------------------------------------------------------
+  - id: js-command-injection-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      User input from an HTTP request reaches a child_process call that runs it
+      through a shell, or picks the program to run. An attacker can add shell
+      metacharacters such as `;` or `$(...)` to run any command on the server.
+      Call execFile/spawn with a fixed program and an argument array (no
+      `shell: true`), and check the input against an allowlist.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [node.js, child_process, express, koa, fastify, nextjs, nestjs]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.8"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+        - https://nodejs.org/api/child_process.html#child_processexeccommand-options-callback
+    mode: taint
+    options: *taint_options
+    pattern-sources: *user_input
+    pattern-sanitizers: &cmd_sanitizers
+      - pattern-either:
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: shellescape(...)
+          - pattern: shellEscape(...)
+          - pattern: escapeShellArg(...)
+          - pattern: shq(...)
+          - pattern: quote([...])
+          - pattern: $SHELLQUOTE.quote([...])
+          - pattern: '$ALLOW.includes($V) ? $V : $DEFAULT'
+          - pattern: '$ALLOW.has($V) ? $V : $DEFAULT'
+    pattern-sinks:
+      # exec / execSync: the whole string is parsed by /bin/sh or cmd.exe
+      - &cmd_sink_exec
+        patterns:
+          # Every branch matches the call itself and binds its first argument
+          # to $ARG, so shape checks below cannot slide onto a nested call.
+          - pattern-either: &child_process_call
+              - patterns:
+                  - pattern-either: &module_member_call
+                      # const m = require('mod'); import * as m from 'mod'; import m from 'mod'
+                      - patterns:
+                          - pattern-either:
+                              - pattern-inside: |
+                                  $MODOBJ = require('$MOD')
+                                  ...
+                              - pattern-inside: |
+                                  import * as $MODOBJ from '$MOD'
+                                  ...
+                              - pattern-inside: |
+                                  import $MODOBJ from '$MOD'
+                                  ...
+                          - pattern: $MODOBJ.$FN($ARG, ...)
+                      # require('mod').fn(...)
+                      - pattern: require('$MOD').$FN($ARG, ...)
+                      # const { fn: alias } = require('mod'); import { fn as alias } from 'mod';
+                      # const alias = require('mod').fn; const alias = util.promisify(m.fn)
+                      - patterns:
+                          - pattern-either:
+                              - pattern-inside: |
+                                  const { $FN: $LOCAL } = require('$MOD')
+                                  ...
+                              - pattern-inside: |
+                                  import { $FN as $LOCAL } from '$MOD'
+                                  ...
+                              - pattern-inside: |
+                                  $LOCAL = require('$MOD').$FN
+                                  ...
+                              # const run = util.promisify(require('child_process').exec)
+                              - pattern-inside: |
+                                  $LOCAL = util.promisify(require('$MOD').$FN)
+                                  ...
+                              - pattern-inside: |
+                                  $LOCAL = promisify(require('$MOD').$FN)
+                                  ...
+                              # const run = util.promisify(cp.exec)
+                              - patterns:
+                                  - pattern-either:
+                                      - pattern-inside: |
+                                          $MODOBJ = require('$MOD')
+                                          ...
+                                      - pattern-inside: |
+                                          import * as $MODOBJ from '$MOD'
+                                          ...
+                                      - pattern-inside: |
+                                          import $MODOBJ from '$MOD'
+                                          ...
+                                  - pattern-either:
+                                      - pattern-inside: |
+                                          $LOCAL = util.promisify($MODOBJ.$FN)
+                                          ...
+                                      - pattern-inside: |
+                                          $LOCAL = promisify($MODOBJ.$FN)
+                                          ...
+                              # const { exec } = require('child_process'); const run = promisify(exec)
+                              - patterns:
+                                  - pattern-either:
+                                      - pattern-inside: |
+                                          const { $FN: $IMPORTED } = require('$MOD')
+                                          ...
+                                      - pattern-inside: |
+                                          import { $FN as $IMPORTED } from '$MOD'
+                                          ...
+                                  - pattern-either:
+                                      - pattern-inside: |
+                                          $LOCAL = util.promisify($IMPORTED)
+                                          ...
+                                      - pattern-inside: |
+                                          $LOCAL = promisify($IMPORTED)
+                                          ...
+                              - patterns:
+                                  - pattern-inside: |
+                                      import { $FN } from '$MOD'
+                                      ...
+                                  - pattern-either:
+                                      - pattern-inside: |
+                                          $LOCAL = util.promisify($FN)
+                                          ...
+                                      - pattern-inside: |
+                                          $LOCAL = promisify($FN)
+                                          ...
+                          - pattern: $LOCAL($ARG, ...)
+                      # import { fn } from 'mod'
+                      - patterns:
+                          - pattern-inside: |
+                              import { $FN } from '$MOD'
+                              ...
+                          - pattern: $FN($ARG, ...)
+                  - metavariable-regex:
+                      metavariable: $MOD
+                      regex: ^(node:)?child_process$
+              # names Semgrep resolves itself, e.g. TypeScript `import cp = require('child_process')`
+              - pattern: child_process.$FN($ARG, ...)
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(exec|execSync)$
+          - focus-metavariable: $ARG
+      # spawn / execFile with shell: true (or a shell path): program and arguments
+      - &cmd_sink_shell_option
+        patterns:
+          - pattern-either: *child_process_call
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(spawn|spawnSync|execFile|execFileSync)$
+          - pattern-either:
+              - patterns:
+                  - pattern: '$CALLEE($ARG, ..., {..., shell: $SHELL, ...})'
+                  - focus-metavariable: $ARG
+              - patterns:
+                  - pattern: '$CALLEE($ARG, $CMDARGS, {..., shell: $SHELL, ...}, ...)'
+                  - focus-metavariable: $CMDARGS
+          - metavariable-pattern:
+              metavariable: $SHELL
+              patterns:
+                - pattern-not: 'false'
+                - pattern-not: 'undefined'
+      # spawn('sh', ['-c', cmd]) / spawn('cmd.exe', ['/c', cmd])
+      - &cmd_sink_shell_binary
+        patterns:
+          - pattern-either: *child_process_call
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(spawn|spawnSync|execFile|execFileSync)$
+          - metavariable-regex:
+              metavariable: $ARG
+              regex: ^['"`](/usr)?(/bin/)?(sh|bash|zsh|dash|ksh|cmd|cmd\.exe|powershell|powershell\.exe|pwsh)['"`]$
+          - pattern: $CALLEE($ARG, [..., $CMD, ...], ...)
+          - focus-metavariable: $CMD
+      # shelljs.exec(cmd), execa.command(cmd) / execaCommand(cmd)
+      - &cmd_sink_libs
+        patterns:
+          - pattern-either: *module_member_call
+          - metavariable-regex:
+              metavariable: $MOD
+              regex: ^(shelljs|execa)$
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(exec|command|commandSync|execaCommand|execaCommandSync)$
+          - focus-metavariable: $ARG
+      # spawn(userProgram, ...), execFile(userProgram, ...), fork(userModule)
+      - &cmd_sink_program
+        patterns:
+          - pattern-either: *child_process_call
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(spawn|spawnSync|execFile|execFileSync|fork)$
+          - focus-metavariable: $ARG
+
+  - id: js-command-injection-dynamic
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A shell command is built from a non-constant value (a string
+      concatenation, template literal or function parameter) and run through a
+      shell. If that value can contain user input, an attacker can chain extra
+      commands with `;`, `|` or `$(...)`. Prefer execFile/spawn with a fixed
+      program and an argument array, without `shell: true`.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [node.js, child_process]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+    mode: taint
+    options: *taint_options
+    pattern-sources:
+      # a function parameter used as (part of) the command
+      - patterns:
+          - pattern-either:
+              - pattern-inside: function $FUNC(..., $PARAM, ...) { ... }
+              - pattern-inside: function (..., $PARAM, ...) { ... }
+          - focus-metavariable: $PARAM
+      # a dynamically built string
+      - patterns:
+          - pattern-either: *dynamic_string
+          - pattern-not-inside: |
+              $X = parseInt(...);
+              ...
+          - pattern-not-inside: |
+              $X = parseInt(...) || $DEFAULTNUM;
+              ...
+          - pattern-not-inside: |
+              $X = Number(...);
+              ...
+          - pattern-not-inside: |
+              $X = Number(...) || $DEFAULTNUM;
+              ...
+          - pattern-not-inside: |
+              $X = Math.$MATHFN(...);
+              ...
+          - pattern-not-inside: |
+              $X = $ALLOW.includes(...) ? $A : $B;
+              ...
+          - pattern-not-inside: |
+              $X = $ALLOW.has(...) ? $A : $B;
+              ...
+          - pattern-not-inside: |
+              $X = shellescape(...);
+              ...
+          - pattern-not-inside: |
+              $X = $SHELLQUOTE.quote(...);
+              ...
+          - metavariable-pattern:
+              metavariable: $X
+              patterns:
+                - pattern-not: '"..."'
+                - pattern-not: '"..." + $Y'
+                - pattern-not: '$Y + "..."'
+                - pattern-not: '($Y : number)'
+                - pattern-not: parseInt(...)
+                - pattern-not: Number(...)
+                - pattern-not: $ARR.length
+                - pattern-not: shellescape(...)
+                - pattern-not: shellEscape(...)
+                - pattern-not: escapeShellArg(...)
+                - pattern-not: quote([...])
+                - pattern-not: $SHELLQUOTE.quote([...])
+                - pattern-not-regex: ^[0-9][0-9_.]*$
+                - pattern-not-regex: ^[A-Z][A-Z0-9_]*(\.[A-Za-z0-9_]+)*$
+    pattern-sanitizers: *cmd_sanitizers
+    pattern-sinks:
+      - *cmd_sink_exec
+      - *cmd_sink_shell_option
+      - *cmd_sink_shell_binary
+      - *cmd_sink_libs
+
+  - id: js-command-injection-argv
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A command-line argument (process.argv) is run through a shell or used as
+      the program to execute. If this script is ever called by another service
+      with untrusted arguments, shell metacharacters in them run arbitrary
+      commands. Use execFile/spawn with an argument array and no shell, or
+      validate the arguments first.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [node.js, child_process, cli]
+      confidence: LOW
+      likelihood: LOW
+      impact: HIGH
+      security-severity: "5.5"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+    mode: taint
+    options: *taint_options
+    pattern-sources:
+      # argv[0] is the node binary and argv[1] the script path, both trusted
+      - patterns:
+          - pattern: process.argv[$I]
+          - metavariable-regex:
+              metavariable: $I
+              regex: ^(?![01]$).*
+      - pattern: process.argv.slice(...)
+      - pattern: $PARSER(..., process.argv, ...)
+      - pattern: yargs.argv
+      - pattern: program.opts()
+      - pattern: program.args
+    pattern-sanitizers: *cmd_sanitizers
+    pattern-sinks:
+      - *cmd_sink_exec
+      - *cmd_sink_shell_option
+      - *cmd_sink_shell_binary
+      - *cmd_sink_libs
+      - *cmd_sink_program
+
+  # ---------------------------------------------------------------------------
+  # Code injection (eval, Function, vm, string timers)
+  # ---------------------------------------------------------------------------
+  - id: js-code-injection-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      User input from an HTTP request is executed as JavaScript (eval, new
+      Function, the vm module, or a string passed to setTimeout/setInterval).
+      This lets an attacker run arbitrary code inside the server process; the vm
+      module is not a security sandbox. Never evaluate request data: parse it
+      with JSON.parse or map it to a fixed set of functions.
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [node.js, express, koa, fastify, nextjs, nestjs]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.8"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html#do-not-use-dangerous-functions
+        - https://nodejs.org/api/vm.html#vm-executing-javascript
+    mode: taint
+    options: *taint_options
+    pattern-sources: *user_input
+    pattern-sanitizers: &code_sanitizers
+      - pattern-either:
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: JSON.stringify(...)
+          - pattern: '$ALLOW.includes($V) ? $V : $DEFAULT'
+          - pattern: '$ALLOW.has($V) ? $V : $DEFAULT'
+    pattern-sinks:
+      - patterns: &code_eval_patterns
+          - pattern-either:
+              - pattern: eval($CODE)
+              - pattern: new Function(..., $CODE, ...)
+              - pattern: Function(..., $CODE, ...)
+              - patterns:
+                  - pattern: $GLOBAL.eval($CODE)
+                  - metavariable-regex:
+                      metavariable: $GLOBAL
+                      regex: ^(window|global|globalThis|self)$
+          - focus-metavariable: $CODE
+      - patterns: &code_vm_patterns
+          - pattern-either:
+              - patterns:
+                  - pattern-either: *module_member_call
+                  - metavariable-regex:
+                      metavariable: $MOD
+                      regex: ^(node:)?vm$
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(runInThisContext|runInNewContext|runInContext|compileFunction)$
+              - patterns:
+                  - pattern: vm.$FN($ARG, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(runInThisContext|runInNewContext|runInContext|compileFunction)$
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $VM = require('$MOD')
+                          ...
+                      - pattern-inside: |
+                          import * as $VM from '$MOD'
+                          ...
+                      - pattern-inside: |
+                          import $VM from '$MOD'
+                          ...
+                  - pattern: new $VM.Script($ARG, ...)
+                  - metavariable-regex:
+                      metavariable: $MOD
+                      regex: ^(node:)?vm$
+              - patterns:
+                  - pattern-either:
+                      - patterns:
+                          - pattern-either:
+                              - pattern-inside: |
+                                  const { Script: $SCRIPT } = require('$MOD')
+                                  ...
+                              - pattern-inside: |
+                                  import { Script as $SCRIPT } from '$MOD'
+                                  ...
+                          - pattern: new $SCRIPT($ARG, ...)
+                      - patterns:
+                          - pattern-inside: |
+                              import { Script } from '$MOD'
+                              ...
+                          - pattern: new Script($ARG, ...)
+                  - metavariable-regex:
+                      metavariable: $MOD
+                      regex: ^(node:)?vm$
+              - pattern: new vm.Script($ARG, ...)
+          - focus-metavariable: $ARG
+      - patterns: &code_timer_patterns
+          - pattern-either:
+              - pattern: setTimeout($CODE, ...)
+              - pattern: setInterval($CODE, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern: $GLOBAL.setTimeout($CODE, ...)
+                      - pattern: $GLOBAL.setInterval($CODE, ...)
+                  - metavariable-regex:
+                      metavariable: $GLOBAL
+                      regex: ^(window|global|globalThis|self)$
+          - focus-metavariable: $CODE
+
+  - id: js-code-injection-dynamic
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A non-constant string is executed as JavaScript (eval, new Function, the
+      vm module, or a string passed to setTimeout/setInterval). If any part of
+      it can come from a user, it allows arbitrary code execution. Avoid
+      evaluating code at runtime: use JSON.parse for data and pass functions,
+      not strings, to timers.
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [node.js, browser]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval#never_use_direct_eval!
+    mode: taint
+    options: *taint_options
+    pattern-sources:
+      - label: PARAM
+        patterns:
+          - pattern-either:
+              - pattern-inside: function $FUNC(..., $PARAM, ...) { ... }
+              - pattern-inside: function (..., $PARAM, ...) { ... }
+          - focus-metavariable: $PARAM
+      - label: DYNAMIC
+        patterns:
+          - pattern-either: *dynamic_string
+          - pattern-not-inside: |
+              $X = parseInt(...);
+              ...
+          - pattern-not-inside: |
+              $X = parseInt(...) || $DEFAULTNUM;
+              ...
+          - pattern-not-inside: |
+              $X = Number(...);
+              ...
+          - pattern-not-inside: |
+              $X = Number(...) || $DEFAULTNUM;
+              ...
+          - pattern-not-inside: |
+              $X = Math.$MATHFN(...);
+              ...
+          - pattern-not-inside: |
+              $X = JSON.stringify(...);
+              ...
+          - metavariable-pattern:
+              metavariable: $X
+              patterns:
+                - pattern-not: '"..."'
+                - pattern-not: '"..." + $Y'
+                - pattern-not: '$Y + "..."'
+                - pattern-not: '($Y : number)'
+                - pattern-not: parseInt(...)
+                - pattern-not: Number(...)
+                - pattern-not: JSON.stringify(...)
+                - pattern-not-regex: ^[0-9][0-9_.]*$
+                - pattern-not-regex: ^[A-Z][A-Z0-9_]*(\.[A-Za-z0-9_]+)*$
+    pattern-sanitizers: *code_sanitizers
+    pattern-sinks:
+      - requires: PARAM or DYNAMIC
+        patterns: *code_eval_patterns
+      - requires: PARAM or DYNAMIC
+        patterns: *code_vm_patterns
+      # a timer only evaluates strings; passing a function parameter is normal
+      - requires: DYNAMIC
+        patterns: *code_timer_patterns
+
+  # ---------------------------------------------------------------------------
+  # NoSQL (MongoDB / Mongoose) injection
+  # ---------------------------------------------------------------------------
+  - id: js-nosqli-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Request data reaches a MongoDB/Mongoose query filter without being forced
+      to a plain value. Query strings like `?user[$ne]=x` and JSON bodies arrive
+      as objects, so an attacker can inject operators ($ne, $gt, $regex,
+      $where) to bypass login checks or dump collections. Cast values to the
+      expected type (String(x), Number(x)), wrap them as `{ $eq: x }`, or strip
+      operators with mongo-sanitize.
+    metadata:
+      cwe: "CWE-943: Improper Neutralization of Special Elements in Data Query Logic"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [mongodb, mongoose, express, koa, fastify, nestjs]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "8.6"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05.6-Testing_for_NoSQL_Injection
+        - https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html
+    mode: taint
+    options: *taint_options
+    # Only inputs that can carry objects; path params and headers are strings.
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.body
+              - pattern: $REQ.cookies
+              - pattern: $REQ.signedCookies
+              - pattern: $REQ.payload
+              - pattern: $REQ.json()
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|_req|request|ctx\.request)$
+      - pattern: ctx.query
+      - pattern: event.body
+      - patterns:
+          - pattern-inside: |
+              function $FUNC(..., @$DECORATOR(...) $PARAM, ...) { ... }
+          - focus-metavariable: $PARAM
+          - metavariable-regex:
+              metavariable: $DECORATOR
+              regex: ^(Body|Query)$
+    pattern-sanitizers:
+      # string coercion defeats operator injection, but not inside $where
+      - patterns:
+          - pattern-either:
+              - pattern: String(...)
+              - pattern: $STR.toString()
+              - pattern: '`...`'
+              - pattern: '"..." + $STR'
+              - pattern: '$STR + "..."'
+          - pattern-not-inside: '{..., $where: $JS, ...}'
+          - pattern-not-inside: $QUERY.$where(...)
+      - pattern-either:
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: Boolean(...)
+          - pattern: '{$eq: $V}'
+          - pattern: new ObjectId(...)
+          - pattern: ObjectId(...)
+          - pattern: new $MONGO.ObjectId(...)
+          - pattern: $MONGO.Types.ObjectId(...)
+          - pattern: new $MONGO.Types.ObjectId(...)
+          - pattern: sanitize(...)
+          - pattern: mongoSanitize(...)
+          - pattern: $MONGOSANITIZE.sanitize(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $MODEL.find($FILTER, ...)
+              - pattern: $MODEL.findOne($FILTER, ...)
+              - pattern: $MODEL.findOneAndUpdate($FILTER, ...)
+              - pattern: $MODEL.findOneAndDelete($FILTER, ...)
+              - pattern: $MODEL.findOneAndRemove($FILTER, ...)
+              - pattern: $MODEL.findOneAndReplace($FILTER, ...)
+              - pattern: $MODEL.findAndModify($FILTER, ...)
+              - pattern: $MODEL.updateOne($FILTER, ...)
+              - pattern: $MODEL.updateMany($FILTER, ...)
+              - pattern: $MODEL.deleteOne($FILTER, ...)
+              - pattern: $MODEL.deleteMany($FILTER, ...)
+              - pattern: $MODEL.replaceOne($FILTER, ...)
+              - pattern: $MODEL.countDocuments($FILTER, ...)
+              - pattern: $MODEL.exists($FILTER, ...)
+              - pattern: $MODEL.where($FILTER, ...)
+              - pattern: $MODEL.aggregate($FILTER, ...)
+              - pattern: $MODEL.$where($FILTER, ...)
+          - metavariable-pattern:
+              metavariable: $MODEL
+              patterns:
+                - pattern-not-regex: ^(fs|fse|fsExtra|fsPromises)$
+          # Sequelize / TypeORM options objects ({ where: {...} }) are not Mongo filters
+          - pattern-not: '$ANYMODEL.$ANYFN({..., where: $WHERE, ...}, ...)'
+          - focus-metavariable: $FILTER
+
+  - id: js-nosqli-where-dynamic
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A MongoDB `$where` clause (or `$function` body) is built from a
+      non-constant string, and MongoDB runs it as JavaScript on the database
+      server. If any part of it comes from a user, an attacker can inject code
+      to bypass the filter or exhaust the server. Replace `$where` with normal
+      query operators or `$expr`, passing user values as data.
+    metadata:
+      cwe: "CWE-943: Improper Neutralization of Special Elements in Data Query Logic"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [mongodb, mongoose]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.3"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://www.mongodb.com/docs/manual/reference/operator/query/where/
+    patterns:
+      - pattern-either:
+          - pattern: '{..., $where: $JS, ...}'
+          - pattern: $QUERY.$where($JS)
+          - pattern: '{..., $function: {..., body: $JS, ...}, ...}'
+          - patterns:
+              - pattern: '{..., $accumulator: {..., $STAGE: $JS, ...}, ...}'
+              - metavariable-regex:
+                  metavariable: $STAGE
+                  regex: ^(init|accumulate|merge|finalize)$
+      - metavariable-pattern:
+          metavariable: $JS
+          patterns:
+            - pattern-not: '"..."'
+            - pattern-not: 'function (...) { ... }'
+            - pattern-not: '(...) => $BODY'
+      - focus-metavariable: $JS
+
+  # ---------------------------------------------------------------------------
+  # Server-side template injection
+  # ---------------------------------------------------------------------------
+  - id: js-ssti-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      User input from an HTTP request is used as the template source for a
+      template engine (ejs, pug, Handlebars, Nunjucks, lodash template, doT).
+      Template syntax is code, so an attacker can run arbitrary JavaScript on
+      the server (server-side template injection). Load templates from trusted
+      files and pass user input only as template data (the locals/context
+      argument).
+    metadata:
+      cwe: "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [ejs, pug, handlebars, nunjucks, lodash, express]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.8"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/18-Testing_for_Server-side_Template_Injection
+        - https://portswigger.net/web-security/server-side-template-injection
+    mode: taint
+    options: *taint_options
+    pattern-sources: *user_input
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: '$ALLOW.includes($V) ? $V : $DEFAULT'
+          - pattern: '$ALLOW.has($V) ? $V : $DEFAULT'
+    pattern-sinks: &ssti_sinks
+      # ejs.render(src), pug.compile(src), Handlebars.compile(src), _.template(src) ...
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either: *module_member_call
+                  - metavariable-regex:
+                      metavariable: $MOD
+                      regex: ^(ejs|pug|jade|eta|squirrelly|dot|handlebars|hbs|nunjucks|lodash|lodash-es|underscore)$
+              - patterns:
+                  - pattern: $ENGINE.$FN($ARG, ...)
+                  - metavariable-regex:
+                      metavariable: $ENGINE
+                      regex: ^(ejs|pug|jade|eta|Eta|Sqrl|doT|dot|Handlebars|handlebars|hbs|nunjucks|_|lodash)$
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(render|compile|compileClient|precompile|renderString|template)$
+          # nunjucks.render() takes a template *file name*, not source
+          - pattern-not: nunjucks.render(...)
+          - focus-metavariable: $ARG
+      # lodash.template / lodash/template default export
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $TEMPLATEFN = require('$MOD')
+                  ...
+              - pattern-inside: |
+                  import $TEMPLATEFN from '$MOD'
+                  ...
+          - pattern: $TEMPLATEFN($TEMPLATE, ...)
+          - metavariable-regex:
+              metavariable: $MOD
+              regex: ^(lodash\.template|lodash/template|lodash-es/template)$
+          - focus-metavariable: $TEMPLATE
+      # nunjucks Environment#renderString and new nunjucks.Template(src)
+      - patterns:
+          - pattern-either:
+              - pattern: $NUNJUCKSENV.renderString($TEMPLATE, ...)
+              - pattern: new nunjucks.Template($TEMPLATE, ...)
+          - focus-metavariable: $TEMPLATE
+
+  - id: js-ssti-dynamic
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A template source string is built by concatenating or interpolating a
+      non-constant value and then compiled by a template engine. If that value
+      contains user input, template directives inside it run on the server
+      (server-side template injection). Keep the template static and pass
+      variables through the data/context argument instead.
+    metadata:
+      cwe: "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [ejs, pug, handlebars, nunjucks, lodash]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+        - https://portswigger.net/web-security/server-side-template-injection
+    mode: taint
+    options: *taint_options
+    pattern-sources:
+      - patterns:
+          - pattern-either: *dynamic_string
+          - pattern-not-inside: |
+              $X = $ALLOW.includes(...) ? $A : $B;
+              ...
+          - metavariable-pattern:
+              metavariable: $X
+              patterns:
+                - pattern-not: '"..."'
+                - pattern-not: '"..." + $Y'
+                - pattern-not: '$Y + "..."'
+                - pattern-not: '($Y : number)'
+                - pattern-not: parseInt(...)
+                - pattern-not: Number(...)
+                - pattern-not-regex: ^[0-9][0-9_.]*$
+                - pattern-not-regex: ^[A-Z][A-Z0-9_]*(\.[A-Za-z0-9_]+)*$
+    pattern-sinks: *ssti_sinks
+
+  # ---------------------------------------------------------------------------
+  # Insecure deserialization
+  # ---------------------------------------------------------------------------
+  - id: js-insecure-deserialization-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      User input from an HTTP request is deserialized with node-serialize,
+      funcster, serialize-to-js or cryo. These libraries rebuild functions from
+      the payload (for example node-serialize's `_$$ND_FUNC$$_` marker), so an
+      attacker can execute arbitrary code (CVE-2017-5941). Use JSON.parse and
+      validate the result against a schema instead.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      category: security
+      subcategory: [vuln]
+      technology: [node-serialize, funcster, serialize-to-js, cryo, express]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.8"
+      references:
+        - https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html
+        - https://nvd.nist.gov/vuln/detail/CVE-2017-5941
+    mode: taint
+    options: *taint_options
+    pattern-sources: *user_input
+    pattern-sinks:
+      - patterns:
+          - pattern-either: *module_member_call
+          - metavariable-regex:
+              metavariable: $MOD
+              regex: ^(node-serialize|funcster|serialize-to-js|cryo)$
+          - metavariable-regex:
+              metavariable: $FN
+              regex: ^(unserialize|deserialize|deepDeserialize|parse)$
+          - focus-metavariable: $ARG
+
+  - id: js-insecure-deserialization
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      node-serialize, funcster, serialize-to-js or cryo is used to deserialize a
+      non-constant value. These libraries can revive functions from the data and
+      have known remote-code-execution flaws, so any attacker-influenced payload
+      leads to code execution. Replace them with JSON.parse plus schema
+      validation.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      category: security
+      subcategory: [audit]
+      technology: [node-serialize, funcster, serialize-to-js, cryo]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html
+        - https://nvd.nist.gov/vuln/detail/CVE-2017-5941
+    patterns:
+      - pattern-either: *module_member_call
+      - metavariable-regex:
+          metavariable: $MOD
+          regex: ^(node-serialize|funcster|serialize-to-js|cryo)$
+      - metavariable-regex:
+          metavariable: $FN
+          regex: ^(unserialize|deserialize|deepDeserialize|parse)$
+      - metavariable-pattern:
+          metavariable: $ARG
+          patterns:
+            - pattern-not: '"..."'
+      - focus-metavariable: $ARG

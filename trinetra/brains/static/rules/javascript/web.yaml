@@ -1,0 +1,1377 @@
+# Trinetra static brain: JavaScript / TypeScript web vulnerabilities.
+#
+# Server side (Express, Koa, Fastify, Hapi, Next.js, NestJS, AWS Lambda):
+#   reflected XSS, SSRF, path traversal, open redirect, prototype pollution, CORS.
+# Browser side (vanilla DOM, jQuery, React, Next.js client):
+#   DOM XSS, javascript: URL injection, postMessage origin checks.
+#
+# Injection classes come in pairs:
+#   <id>-tainted   taint rule from real framework user input      (confidence HIGH)
+#   <id>-dynamic-* value handed in by a caller (function parameter,
+#                  React prop) reaching the sink, source unknown   (confidence MEDIUM)
+#
+# YAML anchors (&name / *name) share source, sink and sanitizer blocks between rules.
+
+rules:
+  # ===========================================================================
+  # Reflected XSS (server responses)
+  # ===========================================================================
+  - id: js-xss-reflected-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Request data is written straight into an HTML response, so a crafted link can
+      run attacker script in the victim's browser (reflected XSS). Render it through
+      an auto-escaping template, HTML-encode it (for example with escape-html), or
+      return it as JSON / text/plain instead of HTML.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: MEDIUM
+      security-severity: "7.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+        - https://expressjs.com/en/advanced/best-practice-security.html
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    pattern-sources: &server-sources
+      # Express / Next.js pages API / Fastify / Hapi / Koa request objects
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.cookies
+              - pattern: $REQ.signedCookies
+              - pattern: $REQ.headers
+              - pattern: $REQ.url
+              - pattern: $REQ.originalUrl
+              - pattern: $REQ.path
+              - pattern: $REQ.hostname
+              - pattern: $REQ.querystring
+              - pattern: $REQ.href
+              - pattern: $REQ.payload
+              - pattern: $REQ.state
+              - pattern: $REQ.file
+              - pattern: $REQ.files
+              - pattern: $REQ.nextUrl
+              - pattern: $REQ.get(...)
+              - pattern: $REQ.header(...)
+              - pattern: $REQ.param(...)
+              - pattern: $REQ.json()
+              - pattern: $REQ.text()
+              - pattern: $REQ.formData()
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(_?req|_?request|ctx\.request|ctx\.req|context\.request|context\.req)$
+      # Koa context shortcuts (ctx.body is the response, so it is not listed)
+      - patterns:
+          - pattern-either:
+              - pattern: $CTX.query
+              - pattern: $CTX.params
+              - pattern: $CTX.querystring
+              - pattern: $CTX.headers
+              - pattern: $CTX.header
+              - pattern: $CTX.url
+              - pattern: $CTX.originalUrl
+              - pattern: $CTX.href
+              - pattern: $CTX.path
+              - pattern: $CTX.host
+              - pattern: $CTX.hostname
+              - pattern: $CTX.get(...)
+              - pattern: $CTX.cookies.get(...)
+          - metavariable-regex:
+              metavariable: $CTX
+              regex: ^(ctx|context)$
+      # AWS Lambda / API Gateway events
+      - patterns:
+          - pattern-either:
+              - pattern: $EVT.queryStringParameters
+              - pattern: $EVT.multiValueQueryStringParameters
+              - pattern: $EVT.pathParameters
+              - pattern: $EVT.body
+          - metavariable-regex:
+              metavariable: $EVT
+              regex: ^(event|evt|apiEvent|lambdaEvent)$
+      # NestJS decorated controller parameters: @Query() q, @Param('id') id, @Body() dto
+      - patterns:
+          - pattern-inside: |
+              function $FUNC(..., @$DEC(...) $PARAM, ...) { ... }
+          - pattern: $PARAM
+          - metavariable-regex:
+              metavariable: $DEC
+              regex: ^(Query|Param|Body|Headers|Req|Request|Cookies)$
+      # Next.js App Router page props: export default function Page({ searchParams })
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  function $FUNC(..., {..., searchParams, ...}, ...) { ... }
+              - pattern-inside: |
+                  function (..., {..., searchParams, ...}, ...) { ... }
+              - pattern-inside: |
+                  function $FUNC(..., {..., searchParams, ...}: $TYPE, ...) { ... }
+              - pattern-inside: |
+                  function (..., {..., searchParams, ...}: $TYPE, ...) { ... }
+          - pattern: searchParams
+    pattern-sanitizers:
+      - &html-escapers
+        pattern-either:
+          - pattern: escapeHtml(...)
+          - pattern: escapeHTML(...)
+          - pattern: htmlEscape(...)
+          - pattern: escape(...)
+          - pattern: $LIB.escape(...)
+          - pattern: $LIB.escapeHtml(...)
+          - pattern: $LIB.encode(...)
+          - pattern: sanitizeHtml(...)
+          - pattern: sanitize(...)
+          - pattern: $LIB.sanitize(...)
+          - pattern: xss(...)
+          - pattern: filterXSS(...)
+          - pattern: encodeURIComponent(...)
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: Number.$CONV(...)
+          - pattern: Math.$FN(...)
+          # file contents are not attacker-supplied markup (path traversal is reported separately)
+          - pattern: $FS.readFileSync(...)
+          - pattern: await $FS.readFile(...)
+      # template engines escape by default: ejs/pug/nunjucks/handlebars render, React renderToString
+      - &template-render
+        patterns:
+          - pattern-either:
+              - pattern: $ENGINE.$RENDER(...)
+              - pattern: $RENDER(...)
+          - metavariable-regex:
+              metavariable: $RENDER
+              regex: ^(render|renderFile|renderString|renderToString|renderToStaticMarkup|[\w$]*Template|render[A-Z][\w$]*)$
+    pattern-sinks:
+      # Express / Node http response bodies (Express sends strings as text/html)
+      - &xss-sink-response
+        patterns:
+          - pattern-either:
+              - pattern: $RES.send($BODY)
+              - pattern: $RES.write($BODY, ...)
+              - pattern: $RES.end($BODY, ...)
+          - metavariable-regex:
+              metavariable: $RES
+              regex: ^(res|resp|response|httpResponse|ctx\.res|this\.res|this\.response)\b
+          - pattern-not: $RES.send({...})
+          - pattern-not: $RES.send([...])
+          # a non-HTML Content-Type makes the browser treat the body as data
+          - pattern-not: $R.type("=~/^(?!.*html)/").$SEND(...)
+          - pattern-not: $R.set("=~/(?i)^content-type$/", "=~/^(?!.*html)/").$SEND(...)
+          - pattern-not-inside: |
+              $R.type("=~/^(?!.*html)/");
+              ...
+          - pattern-not-inside: |
+              $R.contentType("=~/^(?!.*html)/");
+              ...
+          - pattern-not-inside: |
+              $R.$SETH("=~/(?i)^content-type$/", "=~/^(?!.*html)/");
+              ...
+          - pattern-not-inside: |
+              $R.writeHead($CODE, {..., "=~/(?i)^content-type$/": "=~/^(?!.*html)/", ...});
+              ...
+          - focus-metavariable: $BODY
+      # Koa: a string body that starts with "<" is served as text/html
+      - &xss-sink-koa
+        patterns:
+          - pattern: $CTX.body = $BODY
+          - metavariable-regex:
+              metavariable: $CTX
+              regex: ^(ctx|context|ctx\.response)$
+          - pattern-not: $CTX.body = {...}
+          - pattern-not-inside: |
+              $CTX.type = "=~/^(?!.*html)/";
+              ...
+          - focus-metavariable: $BODY
+      # Fastify: reply.send is text/plain unless the handler switches to HTML
+      - &xss-sink-fastify
+        patterns:
+          - pattern-either:
+              - pattern: $REPLY.type("=~/html/").send($BODY)
+              - pattern: $REPLY.header("=~/(?i)^content-type$/", "=~/html/").send($BODY)
+              - patterns:
+                  - pattern-inside: |
+                      $REPLY.type("=~/html/");
+                      ...
+                  - pattern: $REPLY.send($BODY)
+          - focus-metavariable: $BODY
+      # Hapi: h.response(string) defaults to text/html
+      - &xss-sink-hapi
+        patterns:
+          - pattern: $H.response($BODY)
+          - metavariable-regex:
+              metavariable: $H
+              regex: ^h$
+          - pattern-not: $H.response({...})
+          - focus-metavariable: $BODY
+
+  - id: js-xss-reflected-dynamic-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      HTML markup is concatenated with a value passed in by the caller and sent as
+      the response body without HTML-encoding. If that value can come from a user,
+      it can inject script (XSS). Use an auto-escaping template engine or wrap every
+      interpolated value in an HTML escaper such as escape-html.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.4"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    pattern-sources:
+      # a string literal (or template piece) containing an HTML tag
+      - label: HTML
+        pattern: '"=~/<[a-zA-Z!\/]/"'
+      # a value handed in by the caller: any parameter except framework plumbing.
+      # The source is the parameter declaration, so a later check on it can sanitize it.
+      - &dyn-param-source
+        label: DYN
+        patterns:
+          - pattern-either:
+              - pattern: function $FUNC(..., $PARAM, ...) { ... }
+              - pattern: function (..., $PARAM, ...) { ... }
+              - pattern: function $FUNC(..., {..., $PARAM, ...}, ...) { ... }
+              - pattern: function (..., {..., $PARAM, ...}, ...) { ... }
+              - pattern: 'function $FUNC(..., {..., $PARAM, ...}: $TYPE, ...) { ... }'
+              - pattern: 'function (..., {..., $PARAM, ...}: $TYPE, ...) { ... }'
+          - focus-metavariable: $PARAM
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: ^(?!(_?req|_?res|request|response|ctx|context|next|reply|h|err|error|cb|callback|done|e|ev|evt|event)$)[A-Za-z_$][\w$]*$
+    pattern-sanitizers:
+      - *html-escapers
+      - *template-render
+    pattern-sinks:
+      - <<: *xss-sink-response
+        requires: HTML and DYN
+      - <<: *xss-sink-koa
+        requires: HTML and DYN
+      - <<: *xss-sink-fastify
+        requires: HTML and DYN
+      - <<: *xss-sink-hapi
+        requires: HTML and DYN
+
+  # ===========================================================================
+  # Server-side request forgery
+  # ===========================================================================
+  - id: js-ssrf-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      An outbound HTTP request is sent to a URL or host taken from the incoming
+      request. An attacker can make the server call internal services or cloud
+      metadata endpoints (SSRF). Only call hosts from a fixed allowlist, or build the
+      URL from a constant base and pass user data only as path or query values.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery (SSRF)"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "8.6"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+        - https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+        - https://cwe.mitre.org/data/definitions/918.html
+    mode: taint
+    pattern-sources: *server-sources
+    pattern-sanitizers: &url-sanitizers
+      # a literal prefix that already fixes the scheme and host: "https://api.example.com/..."
+      - &fixed-host-prefix
+        patterns:
+          - pattern: $URLEXPR
+          - metavariable-regex:
+              metavariable: $URLEXPR
+              regex: ^["'`]https?://[^/"'`$\s]+/
+      # a configured base URL or host: `${API_BASE}/...`, process.env.API_URL + "/...", `https://${process.env.HOST}/`
+      - patterns:
+          - pattern: $URLEXPR
+          - metavariable-regex:
+              metavariable: $URLEXPR
+              regex: ^(`(https?://)?\$\{\s*(process\.env\.\w+|[A-Z][A-Z0-9_]*|(this\.)?config\.[\w.]+)\s*\}[/:]|(process\.env\.\w+|[A-Z][A-Z0-9_]*|(this\.)?config\.[\w.]+)\s*\+\s*["'`][/:?])
+      # allowlist checks: if (!ALLOWED.includes(next)) ..., if (!ALLOWED_HOSTS.has(url.hostname)) ...,
+      # if (!isAllowedUrl(target)) ...  (each form is its own sanitizer so overlapping
+      # matches such as `url.hostname` vs `url` do not shadow one another)
+      - &allowlist-check
+        by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern-inside: $ALLOW.includes($CHECKED)
+              - pattern-inside: $ALLOW.has($CHECKED)
+          - pattern: $CHECKED
+          - metavariable-regex:
+              metavariable: $CHECKED
+              regex: ^[\w$]+$
+      - &allowlist-check-part
+        by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern-inside: $ALLOW.includes($CHECKED.$PART)
+              - pattern-inside: $ALLOW.has($CHECKED.$PART)
+              - patterns:
+                  - pattern-inside: $CHECKFN($CHECKED.$PART)
+                  - metavariable-regex:
+                      metavariable: $CHECKFN
+                      regex: ^[\w$]*(?i:allow|trust|safe|whitelist|permit)[\w$]*$
+          - pattern: $CHECKED
+          - metavariable-regex:
+              metavariable: $CHECKED
+              regex: ^[\w$]+$
+      - &allowlist-check-fn
+        by-side-effect: true
+        patterns:
+          - pattern-inside: $CHECKFN(..., $CHECKED, ...)
+          - metavariable-regex:
+              metavariable: $CHECKFN
+              regex: ^[\w$]*(?i:allow|trust|safe|whitelist|permit)[\w$]*$
+          - pattern: $CHECKED
+          - metavariable-regex:
+              metavariable: $CHECKED
+              regex: ^[\w$]+$
+      - pattern-either:
+          - pattern: encodeURIComponent(...)
+          - pattern: parseInt(...)
+          - pattern: Number(...)
+    pattern-sinks:
+      - &ssrf-url-sinks
+        patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: axios.$VERB($URL, ...)
+              - pattern: got($URL, ...)
+              - pattern: got.$VERB($URL, ...)
+              - pattern: request($URL, ...)
+              - pattern: request.$VERB($URL, ...)
+              - pattern: superagent.$VERB($URL, ...)
+              - pattern: needle.$VERB($URL, ...)
+              - pattern: needle($METHOD, $URL, ...)
+              - pattern: ky($URL, ...)
+              - pattern: ky.$VERB($URL, ...)
+              - pattern: undici.$VERB($URL, ...)
+              - pattern: http.get($URL, ...)
+              - pattern: http.request($URL, ...)
+              - patterns:
+                  - pattern: $SVC.$VERB($URL, ...)
+                  - metavariable-regex:
+                      metavariable: $SVC
+                      regex: ^this\.(http|httpService|httpClient|axios)$
+                  - metavariable-regex:
+                      metavariable: $VERB
+                      regex: ^(get|post|put|patch|delete|head|request)$
+              - pattern: https.get($URL, ...)
+              - pattern: https.request($URL, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          import $CLIENT from "=~/^(axios|got|node-fetch|cross-fetch|isomorphic-fetch|superagent|needle|ky|request|undici)$/";
+                          ...
+                      - pattern-inside: |
+                          $CLIENT = require("=~/^(axios|got|node-fetch|cross-fetch|isomorphic-fetch|superagent|needle|ky|request|undici)$/");
+                          ...
+                  - pattern-either:
+                      - pattern: $CLIENT($URL, ...)
+                      - pattern: $CLIENT.$VERB($URL, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          import $HTTP from "=~/^(node:)?https?$/";
+                          ...
+                      - pattern-inside: |
+                          import * as $HTTP from "=~/^(node:)?https?$/";
+                          ...
+                      - pattern-inside: |
+                          $HTTP = require("=~/^(node:)?https?$/");
+                          ...
+                  - pattern-either:
+                      - pattern: $HTTP.get($URL, ...)
+                      - pattern: $HTTP.request($URL, ...)
+          # the exact expression was checked against an allowlist first
+          - pattern-not-inside: |
+              if (<... $ALLOW.includes($URL) ...>) $THEN;
+          - pattern-not-inside: |
+              if (<... $ALLOW.has($URL) ...>) $THEN;
+          - pattern-not-inside: |
+              if (<... $ALLOW.includes($URL) ...>) $THEN;
+              ...
+          - pattern-not-inside: |
+              if (<... $ALLOW.has($URL) ...>) $THEN;
+              ...
+          - focus-metavariable: $URL
+      - &ssrf-config-sinks
+        patterns:
+          - pattern-either:
+              - pattern: 'axios({..., url: $URL, ...})'
+              - pattern: 'axios.request({..., url: $URL, ...})'
+              - pattern: 'axios.create({..., baseURL: $URL, ...})'
+              - pattern: 'got({..., url: $URL, ...})'
+              - pattern: 'request({..., url: $URL, ...})'
+              - pattern: 'request({..., uri: $URL, ...})'
+              - patterns:
+                  - pattern-either:
+                      - pattern: '$HTTP.$VERB({..., host: $URL, ...}, ...)'
+                      - pattern: '$HTTP.$VERB({..., hostname: $URL, ...}, ...)'
+                  - metavariable-regex:
+                      metavariable: $HTTP
+                      regex: ^(http|https)$
+                  - metavariable-regex:
+                      metavariable: $VERB
+                      regex: ^(get|request)$
+          - focus-metavariable: $URL
+
+  - id: js-ssrf-dynamic-host
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      The host part of an outbound request URL is built from a value passed in by the
+      caller (for example "https://" + host). If that value can come from a user,
+      the server can be pointed at internal systems (SSRF). Resolve the host from a
+      fixed allowlist or configuration instead of accepting it as input.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery (SSRF)"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "6.5"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/918.html
+    mode: taint
+    pattern-sources:
+      - *dyn-param-source
+      # the caller's value sits right after the scheme, i.e. it is the host
+      - label: DYNHOST
+        requires: DYN
+        patterns:
+          - pattern-either:
+              - pattern: '"=~/^(https?:|wss?:|ftp:|gopher:)?\/\/$/" + $HOST'
+              - pattern: '$SCHEME + "://" + $HOST'
+              - pattern: "`http://${$HOST}...`"
+              - pattern: "`https://${$HOST}...`"
+              - pattern: "`ws://${$HOST}...`"
+              - pattern: "`wss://${$HOST}...`"
+              - pattern: "`//${$HOST}...`"
+              - pattern: "`${$SCHEME}://${$HOST}...`"
+          - focus-metavariable: $HOST
+    pattern-sanitizers: *url-sanitizers
+    pattern-sinks:
+      - <<: *ssrf-url-sinks
+        requires: DYNHOST
+      - <<: *ssrf-config-sinks
+        requires: DYN
+
+  # ===========================================================================
+  # Path traversal
+  # ===========================================================================
+  - id: js-path-traversal-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A file path built from request data is opened, written, deleted or sent. Input
+      such as "../../etc/passwd" escapes the intended directory (path traversal).
+      Reduce the input to a file name with path.basename(), or resolve the full path
+      and reject it unless it starts with the allowed root directory.
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://owasp.org/www-community/attacks/Path_Traversal
+        - https://nodejs.org/en/learn/manipulating-files/nodejs-file-paths
+        - https://cwe.mitre.org/data/definitions/22.html
+    mode: taint
+    pattern-sources: *server-sources
+    pattern-sanitizers: &path-sanitizers
+      - pattern-either:
+          - pattern: path.basename(...)
+          - pattern: basename(...)
+          - pattern: sanitizeFilename(...)
+          - pattern: sanitize(...)
+          - pattern: parseInt(...)
+          - pattern: Number(...)
+      # full = path.resolve(root, input); if (!full.startsWith(root)) ...
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $FULL = path.resolve(...);
+                  ...
+              - pattern-inside: |
+                  $FULL = path.join(...);
+                  ...
+              - pattern-inside: |
+                  $FULL = path.normalize(...);
+                  ...
+              - pattern-inside: |
+                  $FULL = $FS.realpathSync(...);
+                  ...
+              - pattern-inside: |
+                  $FULL = await $FS.realpath(...);
+                  ...
+          - pattern-either:
+              - pattern-inside: $FULL.startsWith(...)
+              - pattern-inside: $FULL.indexOf(...)
+              - pattern-inside: $FULL.slice(0, ...)
+              - pattern-inside: $FULL.substring(0, ...)
+              - pattern-inside: $FULL.substr(0, ...)
+          - pattern: $FULL
+      # rel = path.relative(root, full); if (rel.startsWith('..')) ...
+      - by-side-effect: true
+        patterns:
+          - pattern-inside: |
+              $REL = path.relative($ROOT, $FULL);
+              ...
+              if (<... $REL.startsWith(...) ...>) $THEN;
+          - pattern: $FULL
+      - *allowlist-check
+      - *allowlist-check-part
+      - *allowlist-check-fn
+      - by-side-effect: true
+        patterns:
+          - pattern-inside: $RE.test($CHECKED)
+          - pattern: $CHECKED
+    pattern-sinks:
+      - &path-sinks
+        patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: $FS.$FSFN($FILE, ...)
+                      - pattern: $FS.promises.$FSFN($FILE, ...)
+                  - metavariable-regex:
+                      metavariable: $FS
+                      regex: ^(fs|fsp|fsPromises|fse|fsExtra|fs\.promises|promises)$
+              - patterns:
+                  - pattern-inside: |
+                      import { ..., $FSFN, ... } from "=~/^(node:)?fs(\/promises)?$|^fs-extra$/";
+                      ...
+                  - pattern: $FSFN($FILE, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          import $FS from "=~/^(node:)?fs(\/promises)?$|^fs-extra$/";
+                          ...
+                      - pattern-inside: |
+                          import * as $FS from "=~/^(node:)?fs(\/promises)?$|^fs-extra$/";
+                          ...
+                      - pattern-inside: |
+                          $FS = require("=~/^(node:)?fs(\/promises)?$|^fs-extra$/");
+                          ...
+                  - pattern: $FS.$FSFN($FILE, ...)
+          - metavariable-regex:
+              metavariable: $FSFN
+              regex: ^(readFile|readFileSync|createReadStream|createWriteStream|writeFile|writeFileSync|appendFile|appendFileSync|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|readdir|readdirSync|open|openSync|copyFile|copyFileSync|rename|renameSync|truncate|truncateSync|outputFile|outputFileSync|remove|removeSync|readJson|readJsonSync)$
+          - focus-metavariable: $FILE
+      # res.sendFile / res.download without a root option (with root, send() rejects "..")
+      - &path-sinks-express
+        patterns:
+          - pattern-either:
+              - pattern: $RES.sendFile($FILE, ...)
+              - pattern: $RES.download($FILE, ...)
+          - pattern-not: '$RES.sendFile($FILE, {..., root: $ROOT, ...}, ...)'
+          - pattern-not: '$RES.download($FILE, ..., {..., root: $ROOT, ...}, ...)'
+          - focus-metavariable: $FILE
+
+  - id: js-path-traversal-dynamic-path
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A file path is joined or concatenated from a value passed in by the caller and
+      then used for a file operation. If that value can come from a user, "../"
+      sequences can reach files outside the intended directory. Apply
+      path.basename() to the name, or resolve the path and check it still starts with
+      the allowed root before using it.
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "5.9"
+      references:
+        - https://owasp.org/www-community/attacks/Path_Traversal
+        - https://cwe.mitre.org/data/definitions/22.html
+    mode: taint
+    pattern-sources:
+      - *dyn-param-source
+      # the caller's value is combined into a longer path
+      - label: BUILT
+        requires: DYN
+        pattern-either:
+          - pattern: path.join(...)
+          - pattern: path.resolve(...)
+          - pattern: $LEFT + $RIGHT
+          - pattern: "`...`"
+    pattern-sanitizers: *path-sanitizers
+    pattern-sinks:
+      - <<: *path-sinks
+        requires: BUILT
+      - <<: *path-sinks-express
+        requires: BUILT
+
+  # ===========================================================================
+  # Open redirect
+  # ===========================================================================
+  - id: js-open-redirect-tainted
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      The redirect target comes from the request, so an attacker can send users from
+      a trusted link to a phishing site (open redirect). Redirect only to relative
+      paths you build yourself or to URLs on an allowlist; a check that only
+      requires a leading "/" still lets "//evil.example" through.
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: MEDIUM
+      security-severity: "6.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/601.html
+    mode: taint
+    pattern-sources: *server-sources
+    pattern-sanitizers: &redirect-sanitizers
+      # literal prefix that pins the target: "/account/" + x, `/users/${id}`, "https://app.example.com/" + x
+      - &safe-url-prefix
+        patterns:
+          - pattern: $URLEXPR
+          - metavariable-regex:
+              metavariable: $URLEXPR
+              regex: ^["'`](/[^/\\"'`$]|\.{1,2}/|[?#]|https?://[^/"'`$\s]+/)
+      - *allowlist-check
+      - *allowlist-check-part
+      - *allowlist-check-fn
+      - by-side-effect: true
+        patterns:
+          - pattern-inside: $CHECKFN(..., $CHECKED, ...)
+          - metavariable-regex:
+              metavariable: $CHECKFN
+              regex: ^[\w$]*(?i:local|relative|internal|sameorigin|samesite)[\w$]*$
+          - pattern: $CHECKED
+          - metavariable-regex:
+              metavariable: $CHECKED
+              regex: ^[\w$]+$
+      - pattern-either:
+          - pattern: encodeURIComponent(...)
+          - pattern: parseInt(...)
+          - pattern: Number(...)
+          # new URL("/login", request.url) keeps the app's own origin
+          - pattern: new URL("=~/^(\/[^\/\\]|\.{1,2}\/|[?#])/", ...)
+    pattern-sinks:
+      - &redirect-sinks
+        patterns:
+          - pattern-either:
+              - pattern: $RES.redirect($TARGET)
+              - pattern: $RES.redirect($STATUS, $TARGET)
+              - pattern: $RES.location($TARGET)
+              - patterns:
+                  - pattern: $RES.$SETH("=~/(?i)^location$/", $TARGET)
+                  - metavariable-regex:
+                      metavariable: $SETH
+                      regex: ^(setHeader|set|header|append)$
+              - pattern: '$RES.writeHead($STATUS, {..., "=~/(?i)^location$/": $TARGET, ...})'
+              - pattern: '$RES.writeHead($STATUS, {..., Location: $TARGET, ...})'
+              - pattern: NextResponse.redirect($TARGET, ...)
+              - pattern: Response.redirect($TARGET, ...)
+              - patterns:
+                  - pattern-inside: |
+                      import { ..., $NAV, ... } from "next/navigation";
+                      ...
+                  - pattern: $NAV($TARGET, ...)
+                  - metavariable-regex:
+                      metavariable: $NAV
+                      regex: ^(redirect|permanentRedirect)$
+          # the exact expression was checked against an allowlist first
+          - pattern-not-inside: |
+              if (<... $ALLOW.includes($TARGET) ...>) $THEN;
+          - pattern-not-inside: |
+              if (<... $ALLOW.has($TARGET) ...>) $THEN;
+          - pattern-not-inside: |
+              if (<... $ALLOW.includes($TARGET) ...>) $THEN;
+              ...
+          - pattern-not-inside: |
+              if (<... $ALLOW.has($TARGET) ...>) $THEN;
+              ...
+          - focus-metavariable: $TARGET
+
+  - id: js-open-redirect-dynamic-url
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A redirect is sent to a URL passed in by the caller. If that value can come
+      from a user (a returnTo or next parameter), it can send victims to an attacker
+      site. Accept only relative paths you validate, or map the input to an
+      allowlisted destination.
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "4.7"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/601.html
+    mode: taint
+    pattern-sources:
+      - *dyn-param-source
+    pattern-sanitizers: *redirect-sanitizers
+    pattern-sinks:
+      - <<: *redirect-sinks
+        requires: DYN
+
+  # ===========================================================================
+  # Prototype pollution
+  # ===========================================================================
+  - id: js-prototype-pollution-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Request data controls object keys in a deep merge, a path setter or a nested
+      assignment. Keys such as "__proto__" or "constructor.prototype" then modify
+      Object.prototype for the whole process, which can bypass checks or lead to
+      code execution. Validate the input against a schema, reject those keys, or
+      use Object.create(null) / Map for attacker-keyed data.
+    metadata:
+      cwe: "CWE-1321: Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      category: security
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Prototype_Pollution_Prevention_Cheat_Sheet.html
+        - https://portswigger.net/web-security/prototype-pollution/server-side
+        - https://cwe.mitre.org/data/definitions/1321.html
+    mode: taint
+    pattern-sources: *server-sources
+    pattern-sanitizers:
+      # explicit key checks: if (key === "__proto__") ..., if (BLOCKED.has(key)) ...
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern-inside: $CHECKED === "__proto__"
+              - pattern-inside: $CHECKED !== "__proto__"
+              - pattern-inside: $ALLOW.includes($CHECKED)
+              - pattern-inside: $ALLOW.has($CHECKED)
+          - pattern: $CHECKED
+    pattern-sinks:
+      # deep merge / path setters
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: $LIB.$MERGE($TARGET, ..., $INPUT, ...)
+                  - metavariable-regex:
+                      metavariable: $MERGE
+                      regex: ^(merge|mergeWith|defaultsDeep|mergeDeep|deepMerge|deepExtend)$
+              - patterns:
+                  - pattern: $MERGE($TARGET, ..., $INPUT, ...)
+                  - metavariable-regex:
+                      metavariable: $MERGE
+                      regex: ^(merge|mergeWith|defaultsDeep|mergeDeep|deepMerge|deepExtend|mergeRecursive|mixinDeep)$
+              - pattern: $JQ.extend(true, $TARGET, ..., $INPUT, ...)
+          - focus-metavariable: $INPUT
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern: $LIB.$SETTER($TARGET, $INPUT, ...)
+                  - metavariable-regex:
+                      metavariable: $LIB
+                      regex: ^(_|lodash|dotProp|objectPath|dot)$
+                  - metavariable-regex:
+                      metavariable: $SETTER
+                      regex: ^(set|setWith|zipObjectDeep|setProperty|str)$
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          import $SETTER from "=~/^(lodash[./]set|lodash[./]setwith|lodash/setWith|set-value|dset|lodash[./]zipobjectdeep)$/";
+                          ...
+                      - pattern-inside: |
+                          $SETTER = require("=~/^(lodash[./]set|lodash[./]setwith|lodash/setWith|set-value|dset|lodash[./]zipobjectdeep)$/");
+                          ...
+                  - pattern: $SETTER($TARGET, $INPUT, ...)
+          - focus-metavariable: $INPUT
+      # obj[userKey][otherKey] = value, obj[userKey].prop = value
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJ[$KEY][$KEY2] = $VAL
+              - pattern: $OBJ[$KEY].$PROP = $VAL
+          - pattern-not-inside: |
+              $OBJ = Object.create(null);
+              ...
+          - pattern-not-inside: |
+              $OBJ = new Map(...);
+              ...
+          - focus-metavariable: $KEY
+      # copying request data onto a shared prototype
+      - patterns:
+          - pattern-either:
+              - pattern: Object.assign($PROTO.prototype, ..., $INPUT, ...)
+              - pattern: Object.assign(Object.getPrototypeOf($X), ..., $INPUT, ...)
+              - pattern: Object.assign($X.__proto__, ..., $INPUT, ...)
+          - focus-metavariable: $INPUT
+
+  - id: js-prototype-pollution-recursive-merge
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      This recursive merge copies every key of the source object into the target
+      without skipping "__proto__", "constructor" or "prototype". Merging parsed JSON
+      such as {"__proto__": {"isAdmin": true}} will modify Object.prototype for the
+      whole process. Skip those keys, copy only own properties with a key allowlist,
+      or build the result on Object.create(null).
+    metadata:
+      cwe: "CWE-1321: Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "6.5"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Prototype_Pollution_Prevention_Cheat_Sheet.html
+        - https://github.com/HoLyVieR/prototype-pollution-nsec18
+        - https://cwe.mitre.org/data/definitions/1321.html
+    patterns:
+      - pattern-inside: |
+          function $F(..., $DST, $SRC, ...) { ... }
+      # the function calls itself: a deep merge
+      - pattern-either:
+          - pattern-inside: |
+              function $F(...) { ... $F(...); ... }
+          - pattern-inside: |
+              function $F(...) { ... this.$F(...); ... }
+          - pattern-inside: |
+              function $F(...) { ... $CLS.$F(...); ... }
+      # iterating over every key of the source
+      - pattern-either:
+          - pattern-inside: |
+              for ($K in $SRC) $BODY;
+          - pattern-inside: |
+              for (const $K of Object.keys($SRC)) $BODY;
+          - pattern-inside: |
+              for (let $K of Object.keys($SRC)) $BODY;
+          - pattern-inside: |
+              for (const [$K, $V] of Object.entries($SRC)) $BODY;
+          - pattern-inside: |
+              for (let [$K, $V] of Object.entries($SRC)) $BODY;
+          - pattern-inside: |
+              Object.keys($SRC).forEach(function ($K) { ... })
+          - pattern-inside: |
+              Reflect.ownKeys($SRC).forEach(function ($K) { ... })
+      - pattern: $DST[$K] = $VAL
+      - pattern-not: $DST[$K] = {}
+      - pattern-not: $DST[$K] = []
+      - pattern-not: $DST[$K] = $DST[$K] || $DEFAULT
+      # guarded merges: explicit key checks anywhere in the function
+      - pattern-not-inside: |
+          function $F(...) { ... if (<... "__proto__" ...>) $GUARD; ... }
+      - pattern-not-inside: |
+          function $F(...) { ... if (<... $DENY.has($K) ...>) $GUARD; ... }
+      - pattern-not-inside: |
+          function $F(...) { ... if (<... $DENY.includes($K) ...>) $GUARD; ... }
+      - pattern-not-inside: |
+          function $F(...) { ... if (<... $KEYCHECK($K) ...>) $GUARD; ... }
+
+  - id: js-prototype-pollution-prototype-assign
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Parsed or caller-supplied data is copied onto a shared prototype with
+      Object.assign or a merge helper. Every object that inherits from that
+      prototype picks up the attacker's properties (prototype pollution). Copy only
+      known fields onto an instance, never onto a .prototype object.
+    metadata:
+      cwe: "CWE-1321: Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      category: security
+      confidence: MEDIUM
+      likelihood: LOW
+      impact: HIGH
+      security-severity: "6.5"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Prototype_Pollution_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/1321.html
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: JSON.parse(...)
+          - pattern: await $RESP.json()
+          - pattern: qs.parse(...)
+          - pattern: querystring.parse(...)
+          - pattern: yaml.load(...)
+          - pattern: YAML.parse(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: Object.assign($PROTO.prototype, ..., $INPUT, ...)
+              - pattern: Object.assign(Object.getPrototypeOf($X), ..., $INPUT, ...)
+              - pattern: Object.assign($X.__proto__, ..., $INPUT, ...)
+              - pattern: $LIB.$MERGE($PROTO.prototype, ..., $INPUT, ...)
+          - focus-metavariable: $INPUT
+
+  # ===========================================================================
+  # CORS
+  # ===========================================================================
+  - id: js-cors-credentials-any-origin
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      CORS is configured with credentials: true while accepting any origin ('*',
+      true, a catch-all regex, or a callback that approves every origin). Any
+      website can then make authenticated requests with the user's cookies and read
+      the responses. List the exact trusted origins instead.
+    metadata:
+      cwe: "CWE-942: Permissive Cross-domain Policy with Untrusted Domains"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.4"
+      references:
+        - https://portswigger.net/web-security/cors
+        - https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
+        - https://github.com/expressjs/cors#configuration-options
+        - https://cwe.mitre.org/data/definitions/942.html
+    pattern-either:
+      - patterns:
+          - pattern: |
+              {..., origin: $ORIGIN, ..., credentials: true, ...}
+          - metavariable-pattern:
+              metavariable: $ORIGIN
+              pattern-either:
+                - pattern: '"*"'
+                - pattern: 'true'
+                - pattern: /.*/
+                - pattern: /^.*$/
+                - pattern: /./
+                - pattern: $REQ.headers.origin
+                - pattern: $REQ.header("=~/(?i)^origin$/")
+                - pattern: $REQ.get("=~/(?i)^origin$/")
+      # origin callbacks that approve or echo every origin
+      - pattern: |
+          {..., origin: ($O, $CB) => $CB(null, true), ..., credentials: true, ...}
+      - pattern: |
+          {..., origin: ($O, $CB) => $CB(null, $O), ..., credentials: true, ...}
+      - pattern: |
+          {..., origin: function ($O, $CB) { $CB(null, true); }, ..., credentials: true, ...}
+      - pattern: |
+          {..., origin: function ($O, $CB) { $CB(null, $O); }, ..., credentials: true, ...}
+      - pattern: |
+          {..., origin: ($C) => $C.get("=~/(?i)^origin$/"), ..., credentials: true, ...}
+      - pattern: |
+          {..., origin: ($C) => $C.request.header.origin, ..., credentials: true, ...}
+
+  - id: js-cors-header-origin-reflection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Access-Control-Allow-Origin is set to '*' or to the request's own Origin header
+      while Access-Control-Allow-Credentials is true. Echoing the origin trusts every
+      website, so any page the user visits can read authenticated responses. Echo
+      the origin only after checking it against an allowlist.
+    metadata:
+      cwe: "CWE-942: Permissive Cross-domain Policy with Untrusted Domains"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.4"
+      references:
+        - https://portswigger.net/web-security/cors
+        - https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+        - https://cwe.mitre.org/data/definitions/942.html
+    patterns:
+      # Access-Control-Allow-Origin is '*' or the request Origin, directly or via a variable
+      - pattern-either:
+          - patterns:
+              - pattern-either: &acao-set
+                  - patterns:
+                      - pattern: $RES.$SETH("=~/(?i)^access-control-allow-origin$/", $ORIGIN)
+                      - metavariable-regex:
+                          metavariable: $SETH
+                          regex: ^(setHeader|header|set|append)$
+                  # header objects: res.set({...}), res.writeHead(200, {...}), new Response(b, { headers: {...} })
+                  - pattern: |
+                      {..., "=~/(?i)^access-control-allow-origin$/": $ORIGIN, ...}
+              - metavariable-pattern:
+                  metavariable: $ORIGIN
+                  pattern-either: &request-origin
+                    - pattern: '"*"'
+                    - pattern: $REQ.headers.origin
+                    - pattern: $REQ.headers["=~/(?i)^origin$/"]
+                    - pattern: $REQ.header("=~/(?i)^origin$/")
+                    - pattern: $REQ.get("=~/(?i)^origin$/")
+                    - pattern: $REQ.headers.get("=~/(?i)^origin$/")
+                    - pattern: $CTX.request.header.origin
+          - patterns:
+              - pattern-inside: |
+                  $ORIGINVAR = $ORIGINEXPR;
+                  ...
+              - pattern-either: *acao-set
+              - metavariable-pattern:
+                  metavariable: $ORIGIN
+                  pattern: $ORIGINVAR
+              - metavariable-pattern:
+                  metavariable: $ORIGINEXPR
+                  pattern-either: *request-origin
+      # ... and credentials are allowed alongside it (same statement sequence or header object)
+      - pattern-either:
+          - pattern-inside: |
+              $R2.$SETH2("=~/(?i)^access-control-allow-credentials$/", $TRUE);
+              ...
+          - pattern-inside: |
+              $RES.$SETH("=~/(?i)^access-control-allow-origin$/", $ORIGIN);
+              ...
+              $R2.$SETH2("=~/(?i)^access-control-allow-credentials$/", $TRUE);
+          - pattern-inside: |
+              {..., "=~/(?i)^access-control-allow-credentials$/": $TRUE, ...}
+      - metavariable-regex:
+          metavariable: $TRUE
+          regex: ^(true|["']true["'])$
+      # reflection that is gated by an allowlist check is fine
+      - pattern-not-inside: |
+          if (<... $ALLOW.includes($ORIGIN) ...>) $THEN;
+      - pattern-not-inside: |
+          if (<... $ALLOW.has($ORIGIN) ...>) $THEN;
+      - pattern-not-inside: |
+          if (<... $RE.test($ORIGIN) ...>) $THEN;
+      - pattern-not-inside: |
+          if (<... $ALLOW.includes($ORIGIN) ...>) $THEN;
+          ...
+      - pattern-not-inside: |
+          if (<... $ALLOW.has($ORIGIN) ...>) $THEN;
+          ...
+      - pattern-not-inside: |
+          if (<... $RE.test($ORIGIN) ...>) $THEN;
+          ...
+
+  # ===========================================================================
+  # DOM XSS (browser, jQuery, React)
+  # ===========================================================================
+  - id: js-dom-xss-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Data from the URL, the referrer, window.name or a postMessage event is inserted
+      into the page as HTML. An attacker controls those values, so a crafted link
+      or message runs script in the page (DOM-based XSS). Use textContent or React
+      text children, or clean the HTML with DOMPurify.sanitize() first.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: MEDIUM
+      security-severity: "7.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/DOM_based_XSS_Prevention_Cheat_Sheet.html
+        - https://portswigger.net/web-security/cross-site-scripting/dom-based
+        - https://react.dev/reference/react-dom/components/common#dangerously-setting-the-inner-html
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    pattern-sources: &dom-sources
+      - pattern-either:
+          - pattern: location.hash
+          - pattern: location.search
+          - pattern: location.href
+          - pattern: $W.location.hash
+          - pattern: $W.location.search
+          - pattern: $W.location.href
+          - pattern: document.URL
+          - pattern: document.documentURI
+          - pattern: document.baseURI
+          - pattern: document.referrer
+          - pattern: window.name
+          - pattern: useSearchParams()
+          - pattern: useParams()
+          - pattern: useLocation()
+      # Next.js pages router: const router = useRouter(); router.query.x
+      - patterns:
+          - pattern-inside: |
+              $ROUTER = useRouter();
+              ...
+          - pattern-either:
+              - pattern: $ROUTER.query
+              - pattern: $ROUTER.asPath
+      # Next.js App Router page props
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  function $FUNC(..., {..., searchParams, ...}, ...) { ... }
+              - pattern-inside: |
+                  function (..., {..., searchParams, ...}, ...) { ... }
+              - pattern-inside: |
+                  function $FUNC(..., {..., searchParams, ...}: $TYPE, ...) { ... }
+              - pattern-inside: |
+                  function (..., {..., searchParams, ...}: $TYPE, ...) { ... }
+          - pattern: searchParams
+      # postMessage payloads (handlers that validate event.origin are trusted)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  addEventListener("message", function ($EVT) { ... }, ...)
+              - pattern-inside: |
+                  onmessage = function ($EVT) { ... }
+              - pattern-inside: |
+                  function ($EVT: MessageEvent) { ... }
+              - pattern-inside: |
+                  function ($EVT: MessageEvent<$T>) { ... }
+              - pattern-inside: |
+                  function $FUNC($EVT: MessageEvent) { ... }
+              - pattern-inside: |
+                  function $FUNC($EVT: MessageEvent<$T>) { ... }
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $W.addEventListener("message", function ($EVT) { ... }, ...)
+                      - pattern-inside: |
+                          $W.onmessage = function ($EVT) { ... }
+                      - pattern-inside: |
+                          function $HANDLER($EVT) { ... }
+                          ...
+                          $W.addEventListener("message", $HANDLER, ...);
+                      - pattern-inside: |
+                          $HANDLER = function ($EVT) { ... };
+                          ...
+                          $W.addEventListener("message", $HANDLER, ...);
+                  - metavariable-regex:
+                      metavariable: $W
+                      regex: ^(window|globalThis|document\.defaultView)$
+          - pattern: $EVT.data
+          - pattern-not-inside: |
+              function ($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }
+          - pattern-not-inside: |
+              function $FUNC($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  window.addEventListener("message", function ({..., data, ...}) { ... }, ...)
+              - pattern-inside: |
+                  window.onmessage = function ({..., data, ...}) { ... }
+          - pattern: data
+    pattern-sanitizers:
+      - *html-escapers
+    pattern-sinks:
+      - &dom-html-sinks
+        patterns:
+          - pattern-either:
+              - pattern: $EL.innerHTML = $HTML
+              - pattern: $EL.innerHTML += $HTML
+              - pattern: $EL.outerHTML = $HTML
+              - pattern: $EL.srcdoc = $HTML
+              - pattern: $EL.insertAdjacentHTML($POS, $HTML)
+              - pattern: $RANGE.createContextualFragment($HTML)
+              - pattern: '{..., __html: $HTML, ...}'
+              - patterns:
+                  - pattern-either:
+                      - pattern: $DOC.write(..., $HTML, ...)
+                      - pattern: $DOC.writeln(..., $HTML, ...)
+                  - metavariable-regex:
+                      metavariable: $DOC
+                      regex: ^(.*\.)?(document|contentDocument)$
+              - patterns:
+                  - pattern: $JQOBJ.html($HTML)
+                  - metavariable-regex:
+                      metavariable: $JQOBJ
+                      regex: ^(\$\(|jQuery\(|\$[A-Za-z_])
+          - focus-metavariable: $HTML
+      # jQuery: $(html) and DOM-building methods parse strings as HTML
+      - patterns:
+          - pattern-either:
+              - pattern: $($HTML)
+              - pattern: jQuery($HTML)
+              - patterns:
+                  - pattern: $JQOBJ.$JQFN(..., $HTML, ...)
+                  - metavariable-regex:
+                      metavariable: $JQOBJ
+                      regex: ^(\$\(|jQuery\(|\$[A-Za-z_])
+                  - metavariable-regex:
+                      metavariable: $JQFN
+                      regex: ^(append|prepend|after|before|replaceWith|wrap|wrapAll|wrapInner)$
+          - focus-metavariable: $HTML
+
+  - id: js-dom-xss-dynamic-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A value passed in by the caller or a React prop is inserted into the page as
+      raw HTML (innerHTML, dangerouslySetInnerHTML, document.write, jQuery .html()).
+      If it can contain user content, script in it will run (XSS). Render it as text,
+      or sanitize it with DOMPurify.sanitize() before inserting it.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.4"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/DOM_based_XSS_Prevention_Cheat_Sheet.html
+        - https://react.dev/reference/react-dom/components/common#dangerously-setting-the-inner-html
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    pattern-sources:
+      - *dyn-param-source
+      - label: DYN
+        pattern: this.props
+    pattern-sanitizers:
+      - *html-escapers
+    pattern-sinks:
+      - <<: *dom-html-sinks
+        requires: DYN
+
+  - id: js-dom-javascript-url-tainted
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      The page navigates to a URL taken from the address bar, referrer or a message.
+      A value such as "javascript:alert(document.cookie)" runs script in the page,
+      and an absolute URL sends the user to another site. Allow only relative paths
+      or check that the parsed URL uses http(s) and an allowlisted host.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "6.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/DOM_based_XSS_Prevention_Cheat_Sheet.html
+        - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    pattern-sources: *dom-sources
+    pattern-sanitizers:
+      - *safe-url-prefix
+      - *allowlist-check
+      - *allowlist-check-part
+      - *allowlist-check-fn
+      # protocol / pattern validation: if (url.protocol !== "https:") return; if (!/^\/[a-z]/.test(p)) ...
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: $CHECKED.$URLPART === $EXPECTED
+                      - pattern-inside: $CHECKED.$URLPART !== $EXPECTED
+                      - pattern-inside: $ALLOWED.includes($CHECKED.$URLPART)
+                      - pattern-inside: $ALLOWED.has($CHECKED.$URLPART)
+                  - metavariable-regex:
+                      metavariable: $URLPART
+                      regex: ^(protocol|origin|host|hostname)$
+              - pattern-inside: $RE.test($CHECKED)
+          - pattern: $CHECKED
+      - pattern-either:
+          - pattern: encodeURIComponent(...)
+          - pattern: sanitizeUrl(...)
+          - pattern: parseInt(...)
+          - pattern: Number(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: location = $URL
+              - pattern: $W.location = $URL
+              - pattern: $EL.href = $URL
+              - pattern: location.assign($URL)
+              - pattern: location.replace($URL)
+              - pattern: $W.location.assign($URL)
+              - pattern: $W.location.replace($URL)
+              - pattern: window.open($URL, ...)
+              - pattern: $EL.setAttribute("=~/(?i)^(href|src|action|formaction|xlink:href)$/", $URL)
+              - patterns:
+                  - pattern-inside: |
+                      $ROUTER = useRouter();
+                      ...
+                  - pattern-either:
+                      - pattern: $ROUTER.push($URL, ...)
+                      - pattern: $ROUTER.replace($URL, ...)
+          - focus-metavariable: $URL
+
+  # ===========================================================================
+  # postMessage
+  # ===========================================================================
+  - id: js-postmessage-missing-origin-check
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      This message event handler uses the incoming data without checking
+      event.origin. Any window that can reference this page, including a malicious
+      site that frames or opens it, can send it messages. Compare event.origin with
+      the exact expected origin before trusting event.data.
+    metadata:
+      cwe: "CWE-346: Origin Validation Error"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.4"
+      references:
+        - https://developer.mozilla.org/en-US/docs/Web/API/Window/postMessage#security_concerns
+        - https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html#web-messaging
+        - https://cwe.mitre.org/data/definitions/346.html
+    patterns:
+      - pattern-either:
+          - pattern: addEventListener("message", function ($EVT) { ... }, ...)
+          - pattern: onmessage = function ($EVT) { ... }
+          - patterns:
+              - pattern-either:
+                  - pattern: $W.addEventListener("message", function ($EVT) { ... }, ...)
+                  - pattern: $W.onmessage = function ($EVT) { ... }
+                  - patterns:
+                      - pattern-either:
+                          - pattern-inside: |
+                              function $HANDLER($EVT) { ... }
+                              ...
+                          - pattern-inside: |
+                              $HANDLER = function ($EVT) { ... };
+                              ...
+                      - pattern: $W.addEventListener("message", $HANDLER, ...)
+              # window messages only: worker and WebSocket "message" events are not cross-origin
+              - metavariable-regex:
+                  metavariable: $W
+                  regex: ^(window|globalThis|document\.defaultView)$
+      - pattern-not: $W.addEventListener("message", function ($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }, ...)
+      - pattern-not: addEventListener("message", function ($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }, ...)
+      - pattern-not: $W.onmessage = function ($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }
+      - pattern-not: onmessage = function ($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }
+      - pattern-not: $W.addEventListener("message", function ({..., origin, ...}) { ... }, ...)
+      - pattern-not-inside: |
+          function $HANDLER($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... }
+          ...
+      - pattern-not-inside: |
+          $HANDLER = function ($EVT) { ... if (<... $EVT.origin ...>) $GUARD; ... };
+          ...

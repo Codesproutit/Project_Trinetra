@@ -1,0 +1,1527 @@
+# Trinetra static brain -- Python web vulnerabilities.
+#
+# Frameworks: Flask/Werkzeug, Django (+ DRF), FastAPI/Starlette, Jinja2, Mako,
+# Tornado, requests/httpx/urllib/urllib3/aiohttp, lxml.
+#
+# Injection-style classes come in pairs:
+#   <id>-tainted  taint mode, sources = real request data (HIGH confidence)
+#   <id>-dynamic-*  source unknown: function parameters or runtime-built strings
+#                 reach the sink (MEDIUM confidence)
+#
+# YAML anchors (&name / *name) share source, sink and sanitizer lists between
+# rules so the pairs can never drift apart.
+
+rules:
+  # ===========================================================================
+  # SSRF
+  # ===========================================================================
+  - id: py-ssrf-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      User-controlled input is used as the URL of a server-side HTTP request.
+      An attacker can make the server call internal services, cloud metadata
+      endpoints (169.254.169.254) or file:// URLs (SSRF). Build the URL from a
+      fixed scheme and host, or check the parsed hostname against an allowlist
+      of trusted hosts before sending the request.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery (SSRF)"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, django, fastapi, requests, httpx, urllib, urllib3, aiohttp]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.1"
+      references:
+        - https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/918.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: &py-web-user-input
+      # Request data: Flask/Werkzeug, Django, DRF, Starlette/FastAPI.
+      - patterns:
+          - pattern-either:
+              - pattern: flask.request.$ATTR
+              - pattern: request.$ATTR
+              - pattern: self.request.$ATTR
+          - metavariable-regex:
+              metavariable: $ATTR
+              regex: ^(args|form|values|json|get_json|data|get_data|files|cookies|headers|view_args|stream|referrer|query_string|GET|POST|COOKIES|FILES|META|body|query_params|path_params)$
+      # Route parameters of Flask / FastAPI / Starlette decorated views.
+      - patterns:
+          - pattern: |
+              @$APP.$ROUTE(...)
+              def $VIEW(..., $PARAM, ...):
+                ...
+          - metavariable-regex:
+              metavariable: $ROUTE
+              regex: ^(route|get|post|put|patch|delete|api_route|websocket)$
+          - metavariable-regex:
+              metavariable: $APP
+              regex: ^(?!.*mock).*$
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: ^(?!(self|cls|request|req|response|db|session|background_tasks|settings)$).*$
+          # Parameters the framework converts to a number / UUID cannot carry a payload.
+          - pattern-not: |
+              def $VIEW(..., $PARAM: int, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: int = $DEFAULT, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: float, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: float = $DEFAULT, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: bool, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: bool = $DEFAULT, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: uuid.UUID, ...):
+                ...
+          - pattern-not: |
+              def $VIEW(..., $PARAM: uuid.UUID = $DEFAULT, ...):
+                ...
+          - focus-metavariable: $PARAM
+      # Django function / class-based views: URL captures after `request`.
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  def $VIEW(request, ..., $PARAM, ...):
+                    ...
+              - pattern: |
+                  def $VIEW(self, request, ..., $PARAM, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: ^(?!(self|cls|request)$).*$
+          - focus-metavariable: $PARAM
+    pattern-sanitizers: &py-ssrf-sanitizers
+      - &py-web-safe-values
+        pattern-either:
+          - pattern: int(...)
+          - pattern: float(...)
+          - pattern: bool(...)
+          - pattern: len(...)
+          - pattern: uuid.UUID(...)
+          - pattern: $SRC.get(..., type=int, ...)
+          - pattern: $SRC.get(..., type=float, ...)
+          - pattern: $SRC.get(..., type=bool, ...)
+          - pattern: django.shortcuts.get_object_or_404(...)
+          - pattern: django.shortcuts.get_list_or_404(...)
+          - pattern: $MODEL.objects.$QUERY(...)
+          - pattern: $MODEL.query.$QUERY(...)
+      # URL whose scheme and host are fixed literals, so user data only reaches
+      # the path. A taint sanitizer covers everything inside its matched range.
+      - pattern-regex: (?<![\w.])[rR]?[fF][rR]?(["'])(https?|wss?)://[\w.-]+(:\d+)?[/?#](?:(?!\1)[^\n\\]|\\.)*\1
+      - patterns:
+          - pattern-either:
+              - pattern: $LIT + $REST
+              - pattern: $LIT % $REST
+              - pattern: $LIT.format(...)
+          - metavariable-regex:
+              metavariable: $LIT
+              regex: ^[rRuU]?("|')(https?|wss?)://[\w.-]+(:\d+)?[/?#]
+      # Base URL from a constant, settings, app.config, the environment or a
+      # self attribute, followed by a path separator:
+      # f"{API_BASE}/items/{x}", API_BASE + "/items/" + x, self.base_url + "/x".
+      - &py-trusted-base-fstring
+        pattern-regex: (?<![\w.])[rR]?[fF][rR]?(["'])\{(self\.[\w.]+|settings\.\w+|[A-Z][A-Z0-9_]*|[\w.]*config\[[^\]]+\]|os\.environ\[[^\]]+\]|os\.environ\.get\([^)]*\)|os\.getenv\([^)]*\))\}[/?#](?:(?!\1)[^\n\\]|\\.)*\1
+      - &py-trusted-base-concat
+        patterns:
+          - pattern: $BASE + $REST
+          - metavariable-regex:
+              metavariable: $BASE
+              regex: ^(self\.[\w.]+|settings\.\w+|[A-Z][A-Z0-9_]*|[\w.]*config\[[^\]]+\]|os\.environ\[[^\]]+\]|os\.environ\.get\([^)]*\)|os\.getenv\([^)]*\))\s*\+\s*[fFrRuU]{0,2}("|')[/?#]
+      # Host allowlist checks.
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  if <... $URL ...> in $ALLOW:
+                    ...
+              - pattern-inside: |
+                  if <... $URL ...> not in $ALLOW:
+                    ...
+                  ...
+              - pattern-inside: |
+                  $HOST = $PARSE($URL, ...).$FIELD
+                  ...
+                  if $HOST not in $ALLOW:
+                    ...
+                  ...
+              - pattern-inside: |
+                  $HOST = $PARSE($URL, ...).$FIELD
+                  ...
+                  if $HOST in $ALLOW:
+                    ...
+              - pattern-inside: |
+                  $PARSED = $PARSE($URL, ...)
+                  ...
+                  if <... $PARSED ...> not in $ALLOW:
+                    ...
+                  ...
+          - metavariable-regex:
+              metavariable: $ALLOW
+              regex: (?i).*(allow|whitelist|trusted|permitted|approved).*
+          - pattern: $URL
+      # Dedicated validator functions: if not is_safe_url(url): abort()
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  if not $VALIDATE(..., $URL, ...):
+                    ...
+                  ...
+              - pattern-inside: |
+                  if $VALIDATE(..., $URL, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $VALIDATE
+              regex: (?i).*(safe|allowed|trusted|whitelisted|permitted)_?(url|host|domain|target).*
+          - pattern: $URL
+    pattern-sinks: &py-ssrf-sinks
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: requests.$VERB($URL, ...)
+                      - pattern: requests.$VERB(..., url=$URL, ...)
+                      - pattern: httpx.$VERB($URL, ...)
+                      - pattern: httpx.$VERB(..., url=$URL, ...)
+                  - metavariable-regex:
+                      metavariable: $VERB
+                      regex: ^(get|post|put|patch|delete|head|options)$
+              - pattern: requests.request($METHOD, $URL, ...)
+              - pattern: requests.request(..., url=$URL, ...)
+              - pattern: httpx.request($METHOD, $URL, ...)
+              - pattern: httpx.stream($METHOD, $URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: urllib.request.urlretrieve($URL, ...)
+              - pattern: urllib3.request($METHOD, $URL, ...)
+              - pattern: aiohttp.request($METHOD, $URL, ...)
+              - pattern: http.client.HTTPConnection($URL, ...)
+              - pattern: http.client.HTTPSConnection($URL, ...)
+              # Session / client / pool objects.
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $CLIENT = $FACTORY(...)
+                          ...
+                      - pattern-inside: |
+                          with $FACTORY(...) as $CLIENT:
+                            ...
+                      - pattern-inside: |
+                          async with $FACTORY(...) as $CLIENT:
+                            ...
+                  - metavariable-pattern:
+                      metavariable: $FACTORY
+                      pattern-either:
+                        - pattern: requests.Session
+                        - pattern: requests.session
+                        - pattern: httpx.Client
+                        - pattern: httpx.AsyncClient
+                        - pattern: aiohttp.ClientSession
+                        - pattern: urllib3.PoolManager
+                        - pattern: urllib3.ProxyManager
+                  - pattern-either:
+                      - patterns:
+                          - pattern-either:
+                              - pattern: $CLIENT.$VERB($URL, ...)
+                              - pattern: $CLIENT.$VERB(..., url=$URL, ...)
+                          - metavariable-regex:
+                              metavariable: $VERB
+                              regex: ^(get|post|put|patch|delete|head|options|ws_connect)$
+                      - pattern: $CLIENT.request($METHOD, $URL, ...)
+                      - pattern: $CLIENT.stream($METHOD, $URL, ...)
+                      - pattern: $CLIENT.urlopen($METHOD, $URL, ...)
+              - patterns:
+                  - pattern-either:
+                      - pattern: $FACTORY(...).$VERB($URL, ...)
+                      - pattern: $FACTORY(...).request($METHOD, $URL, ...)
+                  - metavariable-pattern:
+                      metavariable: $FACTORY
+                      pattern-either:
+                        - pattern: requests.Session
+                        - pattern: httpx.Client
+                        - pattern: urllib3.PoolManager
+          - focus-metavariable: $URL
+
+  - id: py-ssrf-dynamic-url
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A function parameter decides the host of an outgoing HTTP request (it is
+      the whole URL or is placed before the host is fixed). If any caller passes
+      user-controlled data, the server can be steered to internal services or
+      cloud metadata endpoints (SSRF). Build URLs from a fixed scheme and host,
+      or validate the parsed hostname against an allowlist before sending.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery (SSRF)"
+      category: security
+      subcategory: [audit]
+      technology: [requests, httpx, urllib, urllib3, aiohttp]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/918.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: &py-function-params
+      - patterns:
+          - pattern: |
+              def $FUNC(..., $PARAM, ...):
+                ...
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: ^(?!(self|cls|request|req)$).*$
+          - pattern-not: |
+              def $FUNC(..., $PARAM: int, ...):
+                ...
+          - pattern-not: |
+              def $FUNC(..., $PARAM: int = $DEFAULT, ...):
+                ...
+          - pattern-not: |
+              def $FUNC(..., $PARAM: uuid.UUID, ...):
+                ...
+          - focus-metavariable: $PARAM
+    pattern-sanitizers: *py-ssrf-sanitizers
+    pattern-sinks: *py-ssrf-sinks
+
+  # ===========================================================================
+  # Path traversal
+  # ===========================================================================
+  - id: py-path-traversal-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      User input is used in a filesystem path. Sequences like '../' or an
+      absolute path let an attacker read, overwrite or delete files outside the
+      intended directory. Reduce the name with werkzeug.utils.secure_filename()
+      or os.path.basename(), serve files with send_from_directory() /
+      safe_join(), or resolve the path with os.path.realpath() and check it
+      still starts with the base directory.
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, django, fastapi, pathlib]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://owasp.org/www-community/attacks/Path_Traversal
+        - https://werkzeug.palletsprojects.com/en/stable/utils/#werkzeug.utils.secure_filename
+        - https://cwe.mitre.org/data/definitions/22.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: *py-web-user-input
+    pattern-sanitizers: &py-path-sanitizers
+      - *py-web-safe-values
+      - pattern-either:
+          - pattern: werkzeug.utils.secure_filename(...)
+          - pattern: werkzeug.security.safe_join(...)
+          - pattern: flask.safe_join(...)
+          - pattern: django.utils._os.safe_join(...)
+          - pattern: os.path.basename(...)
+          - pattern: pathlib.Path(...).name
+          - pattern: pathlib.PurePath(...).name
+          - pattern: io.BytesIO(...)
+          - pattern: io.StringIO(...)
+          - pattern: zipfile.ZipFile(...)
+          - pattern: tarfile.open(...)
+          - pattern: PIL.Image.open(...)
+      # Canonicalise, then prove containment: realpath/abspath/normpath/resolve
+      # followed by startswith / is_relative_to / commonpath.
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  $P = $NORM(...)
+                  ...
+                  if not $P.startswith(...):
+                    ...
+                  ...
+              - pattern-inside: |
+                  $P = $NORM(...)
+                  ...
+                  if $P.startswith(...):
+                    ...
+              - pattern-inside: |
+                  $P = $NORM(...)
+                  ...
+                  if not $P.is_relative_to(...):
+                    ...
+                  ...
+              - pattern-inside: |
+                  $P = $NORM(...)
+                  ...
+                  if $P.is_relative_to(...):
+                    ...
+              - pattern-inside: |
+                  $P = $NORM(...)
+                  ...
+                  if os.path.commonpath([..., $P, ...]) != $BASE:
+                    ...
+                  ...
+              - pattern-inside: |
+                  $P = $NORM(...)
+                  ...
+                  if os.path.commonpath([..., $P, ...]) == $BASE:
+                    ...
+          - metavariable-regex:
+              metavariable: $NORM
+              regex: .*(realpath|abspath|normpath|resolve)$
+          - pattern: $P
+    pattern-sinks: &py-path-sinks
+      - patterns:
+          - pattern-either:
+              - pattern: open($PATH, ...)
+              - pattern: io.open($PATH, ...)
+              - pattern: codecs.open($PATH, ...)
+              - pattern: os.open($PATH, ...)
+              - pattern: gzip.open($PATH, ...)
+              - pattern: bz2.open($PATH, ...)
+              - pattern: lzma.open($PATH, ...)
+              - patterns:
+                  - pattern: os.$FN($PATH, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(remove|unlink|rmdir|removedirs|mkdir|makedirs|listdir|scandir|rename|renames|replace|chmod|chown|truncate)$
+              - patterns:
+                  - pattern-either:
+                      - pattern: shutil.$FN($PATH, ...)
+                      - pattern: shutil.$FN($SRC, $PATH, ...)
+                  - metavariable-regex:
+                      metavariable: $FN
+                      regex: ^(copy|copy2|copyfile|copytree|move|rmtree)$
+              # pathlib: the tainted Path object is the receiver.
+              - patterns:
+                  - pattern: $PATH.$METHOD(...)
+                  - metavariable-regex:
+                      metavariable: $METHOD
+                      regex: ^(read_text|read_bytes|write_text|write_bytes|open|unlink|rmdir|mkdir|touch|iterdir|rename|symlink_to|hardlink_to)$
+              - pattern: flask.send_file($PATH, ...)
+              - pattern: flask.send_file(path_or_file=$PATH, ...)
+              # send_from_directory() already safe_joins its *second* argument.
+              - pattern: flask.send_from_directory($PATH, ...)
+              - pattern: flask.send_from_directory(directory=$PATH, ...)
+              # werkzeug FileStorage.save(dst), PIL Image.save(dst). Django's
+              # Storage.save(name, content) validates names itself.
+              - pattern: $UPLOAD.save($PATH)
+              - pattern: $UPLOAD.save($PATH, buffer_size=$SIZE)
+              - pattern: $UPLOAD.save($PATH, format=$FORMAT, ...)
+          - focus-metavariable: $PATH
+
+  - id: py-path-traversal-dynamic-path
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A function parameter is joined onto a base directory and the result is
+      opened, written, served or deleted without a containment check. If the
+      value can come from a user, '../' or an absolute path escapes the base
+      directory (os.path.join discards the base for absolute paths). Sanitize
+      it with secure_filename() or basename(), or resolve the joined path with
+      realpath() and verify it is still inside the base directory.
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      subcategory: [audit]
+      technology: [python, pathlib, flask]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "6.5"
+      references:
+        - https://owasp.org/www-community/attacks/Path_Traversal
+        - https://docs.python.org/3/library/os.path.html#os.path.join
+        - https://cwe.mitre.org/data/definitions/22.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources:
+      # A parameter appended to a base path: join(BASE, p), BASE / p,
+      # BASE + p, f"{BASE}/{p}", "%s/%s" % (BASE, p), "{}/{}".format(BASE, p).
+      - patterns:
+          - pattern-inside: |
+              def $FUNC(..., $PARAM, ...):
+                ...
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: ^(?!(self|cls|request|req)$).*$
+          - pattern-either:
+              - pattern: os.path.join($BASE, ..., $PARAM, ...)
+              - pattern: $BASE / $PARAM
+              - pattern: $BASE + $PARAM
+              - patterns:
+                  - pattern: f"...{$PARAM}..."
+                  - pattern-not: f"{$PARAM}..."
+              - pattern: '"..." % (..., $BASE, ..., $PARAM, ...)'
+              - pattern: '"...".format(..., $BASE, ..., $PARAM, ...)'
+    pattern-sanitizers: *py-path-sanitizers
+    pattern-sinks: *py-path-sinks
+
+  # ===========================================================================
+  # Open redirect
+  # ===========================================================================
+  - id: py-open-redirect-tainted
+    languages: [python]
+    severity: WARNING
+    message: >-
+      The redirect target comes from user input. Attackers can craft links on
+      your domain that forward victims to a phishing or malware site. Validate
+      the target with django.utils.http.url_has_allowed_host_and_scheme() or a
+      host allowlist, redirect only to relative paths, or redirect to a named
+      route with url_for() / reverse().
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, django, fastapi, starlette]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: MEDIUM
+      security-severity: "6.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/601.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: *py-web-user-input
+    pattern-sanitizers: &py-redirect-sanitizers
+      - *py-web-safe-values
+      - pattern-either:
+          - pattern: flask.url_for(...)
+          - pattern: django.urls.reverse(...)
+          - pattern: django.urls.reverse_lazy(...)
+      # Target with a fixed first path segment ("/profile/{x}") or a fixed host.
+      # A bare "/" + x is NOT safe: x = "/evil.example" gives "//evil.example".
+      - pattern-regex: (?<![\w.])[rR]?[fF][rR]?(["'])(/[\w\-.~%]|https?://[\w.-]+(:\d+)?[/?#])(?:(?!\1)[^\n\\]|\\.)*\1
+      - patterns:
+          - pattern-either:
+              - pattern: $LIT + $REST
+              - pattern: $LIT % $REST
+              - pattern: $LIT.format(...)
+          - metavariable-regex:
+              metavariable: $LIT
+              regex: ^[rRuU]?("|')(/[\w\-.~%]|https?://[\w.-]+(:\d+)?[/?#])
+      - *py-trusted-base-fstring
+      - *py-trusted-base-concat
+      # url_for(...) + "?next=" + x, f"{reverse('x')}?q={x}"
+      - pattern-regex: (?<![\w.])[rR]?[fF][rR]?(["'])\{([\w.]*\.)?(url_for|reverse|reverse_lazy)\((?:(?!\1)[^\n\\]|\\.)*\1
+      - patterns:
+          - pattern: $ROUTE_URL + $REST
+          - metavariable-regex:
+              metavariable: $ROUTE_URL
+              regex: ^([\w.]*\.)?(url_for|reverse|reverse_lazy)\(
+      # url_has_allowed_host_and_scheme() / is_safe_url() style validation.
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  if <... $VALIDATE(..., $URL, ...) ...>:
+                    ...
+              - pattern-inside: |
+                  if <... $VALIDATE(..., url=$URL, ...) ...>:
+                    ...
+              - pattern-inside: |
+                  if not $VALIDATE(..., $URL, ...):
+                    ...
+                  ...
+              - pattern-inside: |
+                  if not $VALIDATE(..., url=$URL, ...):
+                    ...
+                  ...
+              - pattern-inside: $URL if $VALIDATE(..., $URL, ...) else $DEFAULT
+              - pattern-inside: $URL if $VALIDATE(..., url=$URL, ...) else $DEFAULT
+          - metavariable-regex:
+              metavariable: $VALIDATE
+              regex: .*(url_has_allowed_host_and_scheme|is_safe_url|safe_url|safe_redirect|allowed_url|trusted_url|allowed_redirect)$
+          - pattern: $URL
+      # Allowlist membership.
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  if <... $URL ...> in $ALLOW:
+                    ...
+              - pattern-inside: |
+                  if <... $URL ...> not in $ALLOW:
+                    ...
+                  ...
+          - metavariable-regex:
+              metavariable: $ALLOW
+              regex: (?i).*(allow|whitelist|trusted|permitted|approved).*
+          - pattern: $URL
+    pattern-sinks: &py-redirect-sinks
+      - patterns:
+          - pattern-either:
+              - pattern: flask.redirect($URL, ...)
+              - pattern: flask.redirect(location=$URL, ...)
+              - pattern: werkzeug.utils.redirect($URL, ...)
+              - pattern: django.shortcuts.redirect($URL, ...)
+              - pattern: django.http.HttpResponseRedirect($URL, ...)
+              - pattern: django.http.HttpResponsePermanentRedirect($URL, ...)
+              - pattern: starlette.responses.RedirectResponse($URL, ...)
+              - pattern: starlette.responses.RedirectResponse(url=$URL, ...)
+              - pattern: fastapi.responses.RedirectResponse($URL, ...)
+              - pattern: fastapi.responses.RedirectResponse(url=$URL, ...)
+              - pattern: '$RESP.headers["=~/(?i)^location$/"] = $URL'
+              - pattern: '$RESP["=~/(?i)^location$/"] = $URL'
+          - focus-metavariable: $URL
+
+  - id: py-open-redirect-dynamic-url
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A function parameter is used as a redirect target without validation.
+      If it can hold user input (for example a 'next' URL), the application
+      becomes an open redirect that attackers use for phishing. Validate the
+      target with url_has_allowed_host_and_scheme() or an allowlist, or
+      redirect to a named route instead.
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      subcategory: [audit]
+      technology: [flask, django, fastapi, starlette]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.4"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/601.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: *py-function-params
+    pattern-sanitizers: *py-redirect-sanitizers
+    pattern-sinks: *py-redirect-sinks
+
+  # ===========================================================================
+  # Server-side template injection
+  # ===========================================================================
+  - id: py-ssti-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      User input is used as template source code. Jinja2, Django, Mako and
+      Tornado templates can evaluate expressions, so this is server-side
+      template injection, which usually leads to remote code execution. Keep
+      templates static and pass user data only as context variables, e.g.
+      render_template_string(TEMPLATE, name=value).
+    metadata:
+      cwe: "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, jinja2, django, mako, tornado]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "9.3"
+      references:
+        - https://portswigger.net/web-security/server-side-template-injection
+        - https://flask.palletsprojects.com/en/stable/api/#flask.render_template_string
+        - https://cwe.mitre.org/data/definitions/1336.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: *py-web-user-input
+    pattern-sanitizers:
+      - *py-web-safe-values
+    pattern-sinks: &py-template-sinks
+      - patterns:
+          - pattern-either:
+              - pattern: flask.render_template_string($TPL, ...)
+              - pattern: flask.render_template_string(source=$TPL, ...)
+              - pattern: jinja2.Template($TPL, ...)
+              - pattern: django.template.Template($TPL, ...)
+              - pattern: mako.template.Template($TPL, ...)
+              - pattern: mako.template.Template(text=$TPL, ...)
+              - pattern: tornado.template.Template($TPL, ...)
+              - patterns:
+                  - pattern: $ENV.from_string($TPL, ...)
+                  - metavariable-regex:
+                      metavariable: $ENV
+                      regex: (?i).*(env|jinja|engine|template).*
+                  # A sandboxed environment is the supported mitigation.
+                  - pattern-not-inside: |
+                      $ENV = jinja2.sandbox.SandboxedEnvironment(...)
+                      ...
+                  - pattern-not: jinja2.sandbox.SandboxedEnvironment(...).from_string($TPL, ...)
+          - focus-metavariable: $TPL
+
+  - id: py-ssti-dynamic-template
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A template is compiled from a string that was built at runtime with
+      interpolated values (f-string, +, % or format()). If any of those values
+      can be influenced by a user, template syntax such as {{ ... }} inside it
+      is executed: server-side template injection, often remote code
+      execution. Use a constant template and pass the values as context
+      variables.
+    metadata:
+      cwe: "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [flask, jinja2, django, mako, tornado]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "8.1"
+      references:
+        - https://portswigger.net/web-security/server-side-template-injection
+        - https://jinja.palletsprojects.com/en/stable/api/#basics
+        - https://cwe.mitre.org/data/definitions/1336.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources:
+      # A non-constant value interpolated into a string.
+      - patterns:
+          - patterns:
+              - pattern-either:
+                  - pattern: f"...{$PART}..."
+                  - pattern: '"..." + $PART'
+                  - pattern: '$PART + "..."'
+                  - pattern: '"..." % $PART'
+                  - pattern: '"..." % (..., $PART, ...)'
+                  - pattern: '"..." % {..., $KEY: $PART, ...}'
+                  - pattern: '"...".format(..., $PART, ...)'
+                  - pattern: '"...".format(..., $KEY=$PART, ...)'
+              - focus-metavariable: $PART
+          - pattern-not: '"..."'
+          - pattern-not: $LEFT + $RIGHT
+          - pattern-not: ($ITEM, ...)
+          - pattern-not: '{...}'
+    pattern-sanitizers:
+      - *py-web-safe-values
+    pattern-sinks: *py-template-sinks
+
+  # ===========================================================================
+  # Cross-site scripting
+  # ===========================================================================
+  - id: py-xss-tainted
+    languages: [python]
+    severity: WARNING
+    message: >-
+      User input reaches an HTML response, or is marked safe, without being
+      escaped. An attacker can inject script that runs in other users'
+      browsers (cross-site scripting). Render it through an auto-escaping
+      template, escape it with markupsafe.escape() / django.utils.html.escape(),
+      build HTML with format_html(), or return JSON instead.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, django, markupsafe, starlette]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: MEDIUM
+      security-severity: "6.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+        - https://docs.djangoproject.com/en/stable/ref/utils/#django.utils.safestring.mark_safe
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: *py-web-user-input
+    pattern-sanitizers: &py-xss-sanitizers
+      - *py-web-safe-values
+      - pattern-either:
+          - pattern: markupsafe.escape(...)
+          - pattern: flask.escape(...)
+          - pattern: jinja2.escape(...)
+          - pattern: html.escape(...)
+          - pattern: django.utils.html.escape(...)
+          - pattern: django.utils.html.conditional_escape(...)
+          - pattern: django.utils.html.format_html(...)
+          - pattern: bleach.clean(...)
+          - pattern: nh3.clean(...)
+          - pattern: urllib.parse.quote(...)
+          - pattern: urllib.parse.quote_plus(...)
+          # Markup("...").format(x) and Markup("...") % x escape their arguments.
+          - pattern: markupsafe.Markup("...").format(...)
+          - pattern: markupsafe.Markup("...") % $ARGS
+          - pattern: flask.Markup("...").format(...)
+          - pattern: flask.Markup("...") % $ARGS
+          # Responses that are not HTML built from the value.
+          - pattern: flask.jsonify(...)
+          - pattern: flask.render_template(...)
+          - pattern: flask.redirect(...)
+          - pattern: flask.url_for(...)
+          - pattern: flask.abort(...)
+          - pattern: flask.send_file(...)
+          - pattern: flask.send_from_directory(...)
+          - pattern: flask.render_template_string(...)
+          - pattern: django.shortcuts.render(...)
+          - pattern: django.template.loader.render_to_string(...)
+          - pattern: django.http.JsonResponse(...)
+          # Template output: SSTI and autoescape have their own rules.
+          - pattern: $TEMPLATE.render(...)
+          # Data fetched or read by the server is not reflected request input.
+          - pattern: requests.$FETCH(...)
+          - pattern: httpx.$FETCH(...)
+          - pattern: urllib.request.urlopen(...)
+          - pattern: open(...)
+          - pattern: $FILE.read_text(...)
+          - pattern: $FILE.read_bytes(...)
+          - pattern: lxml.etree.$PARSE(...)
+    pattern-sinks:
+      - &py-xss-markup-sinks
+        patterns:
+          - pattern-either:
+              - pattern: markupsafe.Markup($HTML, ...)
+              - pattern: flask.Markup($HTML, ...)
+              - pattern: jinja2.Markup($HTML, ...)
+              - pattern: django.utils.safestring.mark_safe($HTML)
+              - pattern: django.utils.safestring.SafeString($HTML)
+              - pattern: django.utils.safestring.SafeText($HTML)
+          - focus-metavariable: $HTML
+      # HTML responses (text/html is the default content type).
+      - patterns:
+          - pattern-either:
+              - pattern: django.http.HttpResponse($HTML, ...)
+              - pattern: django.http.HttpResponse(content=$HTML, ...)
+              - pattern: flask.make_response($HTML, ...)
+              - pattern: flask.Response($HTML, ...)
+              - pattern: flask.Response(response=$HTML, ...)
+              - pattern: werkzeug.wrappers.Response($HTML, ...)
+              - pattern: starlette.responses.HTMLResponse($HTML, ...)
+              - pattern: starlette.responses.HTMLResponse(content=$HTML, ...)
+              - pattern: fastapi.responses.HTMLResponse($HTML, ...)
+              - pattern: fastapi.responses.HTMLResponse(content=$HTML, ...)
+          - pattern-not: $RESPONSE(..., content_type="=~/(json|text\/plain|text\/csv|octet-stream)/", ...)
+          - pattern-not: $RESPONSE(..., mimetype="=~/(json|text\/plain|text\/csv|octet-stream)/", ...)
+          - focus-metavariable: $HTML
+      # A str returned from a Flask view is sent as text/html.
+      - patterns:
+          - pattern-inside: |
+              @$APP.route(...)
+              def $VIEW(...):
+                ...
+          - pattern: return $HTML
+          - pattern-not: return {...}
+          - pattern-not: return {...}, ...
+          - pattern-not: return [...]
+          # Response objects are checked where they are constructed.
+          - pattern-not: return flask.make_response(...)
+          - pattern-not: return flask.Response(...)
+          - pattern-not: return werkzeug.wrappers.Response(...)
+          - pattern-not-inside: |
+              $RESP = flask.make_response(...)
+              ...
+              return $RESP
+          - pattern-not-inside: |
+              $RESP = flask.Response(...)
+              ...
+              return $RESP
+          # dicts / lists are serialised to JSON by Flask
+          - pattern-not: return dict(...)
+          - pattern-not-inside: |
+              $DATA = {...}
+              ...
+              return $DATA
+          - pattern-not-inside: |
+              $DATA = {...}
+              ...
+              return $DATA, ...
+          - pattern-not-inside: |
+              $DATA = [...]
+              ...
+              return $DATA
+          - focus-metavariable: $HTML
+
+  - id: py-xss-dynamic-safe-markup
+    languages: [python]
+    severity: WARNING
+    message: >-
+      HTML built from runtime values by string formatting is marked as safe
+      (Markup, mark_safe, SafeString), which switches off auto-escaping for the
+      whole string. Any interpolated value that contains user data becomes
+      stored or reflected XSS. Use django.utils.html.format_html() or
+      Markup("...").format(...), which escape every argument, or escape each
+      value explicitly.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [flask, django, markupsafe, jinja2]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.4"
+      references:
+        - https://docs.djangoproject.com/en/stable/ref/utils/#django.utils.html.format_html
+        - https://markupsafe.palletsprojects.com/en/stable/escaping/
+        - https://cwe.mitre.org/data/definitions/79.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources:
+      # A non-constant, non-escaped value interpolated into a string.
+      - patterns:
+          - patterns:
+              - pattern-either:
+                  - pattern: f"...{$PART}..."
+                  - pattern: '"..." + $PART'
+                  - pattern: '$PART + "..."'
+                  - pattern: '"..." % $PART'
+                  - pattern: '"..." % (..., $PART, ...)'
+                  - pattern: '"..." % {..., $KEY: $PART, ...}'
+                  - pattern: '"...".format(..., $PART, ...)'
+                  - pattern: '"...".format(..., $KEY=$PART, ...)'
+              - focus-metavariable: $PART
+          - pattern-not: '"..."'
+          - pattern-not: $LEFT + $RIGHT
+          - pattern-not: ($ITEM, ...)
+          - pattern-not: '{...}'
+          - pattern-not: markupsafe.escape(...)
+          - pattern-not: flask.escape(...)
+          - pattern-not: html.escape(...)
+          - pattern-not: django.utils.html.escape(...)
+          - pattern-not: django.utils.html.conditional_escape(...)
+          - pattern-not: django.utils.html.format_html(...)
+          - pattern-not: bleach.clean(...)
+          - pattern-not: nh3.clean(...)
+          - pattern-not: django.urls.reverse(...)
+          - pattern-not: flask.url_for(...)
+          - pattern-not: int(...)
+          - pattern-not: len(...)
+          # value was escaped into a local variable first
+          - pattern-not-inside: |
+              $PART = markupsafe.escape(...)
+              ...
+          - pattern-not-inside: |
+              $PART = html.escape(...)
+              ...
+          - pattern-not-inside: |
+              $PART = django.utils.html.escape(...)
+              ...
+          - pattern-not-inside: |
+              $PART = django.utils.html.conditional_escape(...)
+              ...
+          - pattern-not-inside: |
+              $PART = django.utils.html.format_html(...)
+              ...
+          - pattern-not-inside: |
+              $PART = bleach.clean(...)
+              ...
+    pattern-sanitizers: *py-xss-sanitizers
+    pattern-sinks:
+      - *py-xss-markup-sinks
+
+  - id: py-jinja2-autoescape-disabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      This Jinja2 environment does not auto-escape: autoescape is False, which
+      is also Jinja2's default when the argument is omitted. Every variable
+      rendered into HTML can then inject script (XSS). Pass autoescape=True or
+      autoescape=select_autoescape() when the templates produce HTML.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      owasp: "A03:2021 - Injection"
+      category: security
+      subcategory: [audit]
+      technology: [jinja2, flask]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "6.1"
+      references:
+        - https://jinja.palletsprojects.com/en/stable/api/#autoescaping
+        - https://cwe.mitre.org/data/definitions/79.html
+    patterns:
+      - pattern-either:
+          - pattern: jinja2.Environment(..., autoescape=False, ...)
+          - pattern: jinja2.Template(..., autoescape=False, ...)
+          - pattern: $ENV.autoescape = False
+          - patterns:
+              - pattern: jinja2.Environment(...)
+              - pattern-not: jinja2.Environment(..., autoescape=$ANY, ...)
+              - pattern-not: jinja2.Environment(..., **$OPTIONS)
+
+  # ===========================================================================
+  # XML external entities
+  # ===========================================================================
+  - id: py-xxe-insecure-parser-config
+    languages: [python]
+    severity: ERROR
+    message: >-
+      This XML parser is configured to resolve external entities or to fetch
+      network resources. Parsing attacker-supplied XML with it allows XML
+      External Entity (XXE) attacks: reading local files, SSRF and denial of
+      service. Keep resolve_entities=False and no_network=True, never enable
+      the SAX external-entity features, or parse untrusted XML with defusedxml.
+    metadata:
+      cwe: "CWE-611: Improper Restriction of XML External Entity Reference"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [lxml, xml.sax]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+        - https://lxml.de/FAQ.html#how-do-i-use-lxml-safely-as-a-web-service-endpoint
+        - https://pypi.org/project/defusedxml/
+    pattern-either:
+      - pattern: lxml.etree.XMLParser(..., resolve_entities=True, ...)
+      - pattern: lxml.etree.XMLParser(..., no_network=False, ...)
+      - pattern: lxml.etree.XMLPullParser(..., resolve_entities=True, ...)
+      - pattern: lxml.etree.XMLPullParser(..., no_network=False, ...)
+      - pattern: lxml.etree.iterparse(..., resolve_entities=True, ...)
+      - pattern: lxml.etree.iterparse(..., no_network=False, ...)
+      - pattern: lxml.objectify.makeparser(..., resolve_entities=True, ...)
+      - pattern: lxml.objectify.makeparser(..., no_network=False, ...)
+      - pattern: $SAX.setFeature(xml.sax.handler.feature_external_ges, True)
+      - pattern: $SAX.setFeature(xml.sax.handler.feature_external_pes, True)
+      - pattern: $SAX.setFeature("=~/external-(general|parameter)-entities/", True)
+
+  - id: py-xxe-tainted
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Request data is parsed with lxml without a hardened parser. With lxml
+      older than 5.0, or with a parser that resolves entities, a crafted
+      document can read local files, reach internal URLs (XXE) or exhaust
+      memory. Parse untrusted XML with defusedxml, or pass
+      parser=etree.XMLParser(resolve_entities=False, no_network=True).
+    metadata:
+      cwe: "CWE-611: Improper Restriction of XML External Entity Reference"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [lxml, flask, django, fastapi]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "9.1"
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+        - https://pypi.org/project/defusedxml/
+        - https://cwe.mitre.org/data/definitions/611.html
+    mode: taint
+    options:
+      taint_assume_safe_numbers: true
+      taint_assume_safe_booleans: true
+    pattern-sources: *py-web-user-input
+    pattern-sanitizers:
+      - *py-web-safe-values
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              # Default parser (no parser argument).
+              - patterns:
+                  - pattern-either:
+                      - pattern: lxml.etree.$PARSE($XML)
+                      - pattern: lxml.etree.$PARSE($XML, base_url=$BASE_URL)
+                      - pattern: lxml.objectify.$PARSE($XML)
+                  - metavariable-regex:
+                      metavariable: $PARSE
+                      regex: ^(fromstring|XML|parse|fromstringlist)$
+              - patterns:
+                  - pattern: lxml.etree.iterparse($XML, ...)
+                  - pattern-not: lxml.etree.iterparse($XML, ..., resolve_entities=False, ...)
+              # An explicitly insecure parser.
+              - patterns:
+                  - pattern-either:
+                      - pattern: lxml.etree.$PARSE($XML, lxml.etree.XMLParser(..., resolve_entities=True, ...), ...)
+                      - pattern: lxml.etree.$PARSE($XML, ..., parser=lxml.etree.XMLParser(..., resolve_entities=True, ...), ...)
+                      - patterns:
+                          - pattern-either:
+                              - pattern-inside: |
+                                  $PARSER = lxml.etree.XMLParser(..., resolve_entities=True, ...)
+                                  ...
+                              - pattern-inside: |
+                                  $PARSER = lxml.etree.XMLParser(..., no_network=False, ...)
+                                  ...
+                          - pattern-either:
+                              - pattern: lxml.etree.$PARSE($XML, $PARSER, ...)
+                              - pattern: lxml.etree.$PARSE($XML, ..., parser=$PARSER, ...)
+          - focus-metavariable: $XML
+
+  # ===========================================================================
+  # Insecure framework configuration
+  # ===========================================================================
+  - id: py-flask-debug-enabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Flask/Werkzeug debug mode is switched on in code. The interactive
+      debugger lets anyone who can reach it run arbitrary Python, and its error
+      pages leak source code and configuration. Remove debug=True and enable
+      debugging only in development through the FLASK_DEBUG environment
+      variable.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, werkzeug]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://flask.palletsprojects.com/en/stable/debugging/
+        - https://werkzeug.palletsprojects.com/en/stable/debug/
+        - https://cwe.mitre.org/data/definitions/489.html
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  import flask
+                  ...
+              - pattern-inside: |
+                  from flask import $NAME
+                  ...
+          - pattern-either:
+              - pattern: $APP.run(..., debug=True, ...)
+              - pattern: $APP.debug = True
+              - pattern: $APP.config["DEBUG"] = True
+              - pattern: $APP.config.update(..., DEBUG=True, ...)
+              - pattern: $APP.config.from_mapping(..., DEBUG=True, ...)
+          # Publicly bound debug servers are reported by py-debug-server-public-bind.
+          - pattern-not: $APP.run(..., host="=~/^(0\.0\.0\.0|::|\[::\])$/", ...)
+          - pattern-not: $APP.run("=~/^(0\.0\.0\.0|::|\[::\])$/", ...)
+          - pattern-not: $APP.run(..., host=<... os.environ.get($VAR, "0.0.0.0") ...>, ...)
+          - pattern-not: $APP.run(..., host=<... os.getenv($VAR, "0.0.0.0") ...>, ...)
+          - pattern-not: asyncio.run(...)
+      - patterns:
+          - pattern-either:
+              - pattern: werkzeug.serving.run_simple(..., use_debugger=True, ...)
+              - pattern: werkzeug.run_simple(..., use_debugger=True, ...)
+          - pattern-not: $RUN("=~/^(0\.0\.0\.0|::|\[::\])$/", ...)
+          - pattern-not: $RUN(..., hostname="=~/^(0\.0\.0\.0|::|\[::\])$/", ...)
+
+  - id: py-debug-server-public-bind
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A development server is started with the interactive debugger enabled
+      and bound to every network interface (0.0.0.0 / ::). Anyone who can
+      reach the port can reach the Werkzeug debugger, which executes arbitrary
+      code. Never combine debug with a public bind: listen on 127.0.0.1 in
+      development and use a production WSGI server (gunicorn, uWSGI) otherwise.
+    metadata:
+      cwe: "CWE-1327: Binding to an Unrestricted IP Address"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [flask, werkzeug]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      security-severity: "8.8"
+      references:
+        - https://werkzeug.palletsprojects.com/en/stable/debug/
+        - https://flask.palletsprojects.com/en/stable/deploying/
+        - https://cwe.mitre.org/data/definitions/1327.html
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  import flask
+                  ...
+              - pattern-inside: |
+                  from flask import $NAME
+                  ...
+          - pattern-either:
+              - pattern: $APP.run(..., host="=~/^(0\.0\.0\.0|::|\[::\])$/", ..., debug=True, ...)
+              - pattern: $APP.run("=~/^(0\.0\.0\.0|::|\[::\])$/", ..., debug=True, ...)
+              - pattern: $APP.run(..., host=<... os.environ.get($VAR, "0.0.0.0") ...>, ..., debug=True, ...)
+              - pattern: $APP.run(..., host=<... os.getenv($VAR, "0.0.0.0") ...>, ..., debug=True, ...)
+              # debug switched on earlier, server bound publicly later
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          $APP.debug = True
+                          ...
+                      - pattern-inside: |
+                          $APP.config["DEBUG"] = True
+                          ...
+                  - pattern-either:
+                      - pattern: $APP.run(..., host="=~/^(0\.0\.0\.0|::|\[::\])$/", ...)
+                      - pattern: $APP.run("=~/^(0\.0\.0\.0|::|\[::\])$/", ...)
+                  - pattern-not: $APP.run(..., debug=False, ...)
+      - pattern: werkzeug.serving.run_simple("=~/^(0\.0\.0\.0|::|\[::\])$/", ..., use_debugger=True, ...)
+      - pattern: werkzeug.serving.run_simple(..., hostname="=~/^(0\.0\.0\.0|::|\[::\])$/", ..., use_debugger=True, ...)
+
+  - id: py-django-debug-enabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      DEBUG is enabled in a settings module, or defaults to True when the
+      environment variable is missing. In production, debug pages show source
+      code, settings, SQL queries and environment details to anyone who
+      triggers an error. Default DEBUG to False and enable it only through an
+      explicit environment variable on development machines.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [django, flask]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.3"
+      references:
+        - https://docs.djangoproject.com/en/stable/ref/settings/#debug
+        - https://docs.djangoproject.com/en/stable/howto/deployment/checklist/
+        - https://cwe.mitre.org/data/definitions/489.html
+    patterns:
+      - pattern-either:
+          # Module-level assignment in a file that is recognisably a settings module.
+          - patterns:
+              - pattern-either: &py-debug-true-values
+                  - pattern: DEBUG = True
+                  - pattern: 'DEBUG: $TYPE = True'
+                  - pattern: DEBUG = <... os.environ.get($VAR, "=~/(?i)^(true|1|yes|on)$/") ...>
+                  - pattern: DEBUG = <... os.getenv($VAR, "=~/(?i)^(true|1|yes|on)$/") ...>
+                  - pattern: DEBUG = <... os.environ.get($VAR, True) ...>
+                  - pattern: DEBUG = <... os.getenv($VAR, True) ...>
+                  - pattern: DEBUG = $ENV.bool($VAR, default=True)
+                  - pattern: DEBUG = <... decouple.config($VAR, ..., default=True, ...) ...>
+                  - pattern: DEBUG = <... decouple.config($VAR, ..., default="=~/(?i)^(true|1|yes|on)$/", ...) ...>
+              - pattern-not-inside: |
+                  class $CLS(...):
+                    ...
+              - pattern-either:
+                  - patterns:
+                      - pattern-either:
+                          - pattern-inside: |
+                              $SETTING = $VALUE
+                              ...
+                          - pattern-inside: |
+                              ...
+                              $SETTING = $VALUE
+                      - metavariable-regex:
+                          metavariable: $SETTING
+                          regex: ^(INSTALLED_APPS|MIDDLEWARE|MIDDLEWARE_CLASSES|ROOT_URLCONF|WSGI_APPLICATION|ASGI_APPLICATION|DATABASES|SECRET_KEY|ALLOWED_HOSTS|TEMPLATES|SQLALCHEMY_DATABASE_URI)$
+                  - pattern-inside: |
+                      from $SETTINGS import *
+                      ...
+          # A production configuration class.
+          - patterns:
+              - pattern-either: *py-debug-true-values
+              - pattern-inside: |
+                  class $CLS(...):
+                    ...
+              - metavariable-regex:
+                  metavariable: $CLS
+                  regex: (?i).*prod.*
+      - pattern-not-inside: |
+          def $FUNC(...):
+            ...
+
+  - id: py-django-allowed-hosts-wildcard
+    languages: [python]
+    severity: WARNING
+    message: >-
+      ALLOWED_HOSTS accepts any Host header ('*'). Django then trusts
+      attacker-supplied host names when it builds absolute URLs, which enables
+      password-reset link poisoning and web cache poisoning. List the exact
+      domain names the site is served on.
+    metadata:
+      cwe: "CWE-183: Permissive List of Allowed Inputs"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [django]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.4"
+      references:
+        - https://docs.djangoproject.com/en/stable/ref/settings/#allowed-hosts
+        - https://docs.djangoproject.com/en/stable/topics/security/#host-header-validation
+        - https://cwe.mitre.org/data/definitions/183.html
+    patterns:
+      - pattern-either:
+          - pattern: ALLOWED_HOSTS = [..., "*", ...]
+          - pattern: ALLOWED_HOSTS = (..., "*", ...)
+          - pattern: 'ALLOWED_HOSTS: $TYPE = [..., "*", ...]'
+          - pattern: ALLOWED_HOSTS += [..., "*", ...]
+          - pattern: ALLOWED_HOSTS.append("*")
+          - pattern: ALLOWED_HOSTS.extend([..., "*", ...])
+          - pattern: ALLOWED_HOSTS = <... os.environ.get($VAR, "=~/^\s*\*\s*(,|$)|,\s*\*\s*(,|$)/") ...>
+          - pattern: ALLOWED_HOSTS = <... os.getenv($VAR, "=~/^\s*\*\s*(,|$)|,\s*\*\s*(,|$)/") ...>
+      - pattern-not-inside: |
+          def $FUNC(...):
+            ...
+
+  - id: py-cookie-secure-disabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A session or CSRF cookie is explicitly configured without the Secure
+      flag, so browsers also send it over plain HTTP where it can be
+      intercepted and replayed. Set SESSION_COOKIE_SECURE and
+      CSRF_COOKIE_SECURE (REMEMBER_COOKIE_SECURE for Flask-Login) to True for
+      any site served over HTTPS.
+    metadata:
+      cwe: "CWE-614: Sensitive Cookie in HTTPS Session Without 'Secure' Attribute"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [django, flask]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "5.0"
+      references:
+        - https://docs.djangoproject.com/en/stable/ref/settings/#session-cookie-secure
+        - https://flask.palletsprojects.com/en/stable/security/#set-cookie-options
+        - https://owasp.org/www-community/controls/SecureCookieAttribute
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $SETTING = False
+              - pattern: '$SETTING: $TYPE = False'
+          - metavariable-regex:
+              metavariable: $SETTING
+              regex: ^(SESSION_COOKIE_SECURE|CSRF_COOKIE_SECURE|REMEMBER_COOKIE_SECURE|LANGUAGE_COOKIE_SECURE)$
+          - pattern-not-inside: |
+              def $FUNC(...):
+                ...
+          - pattern-not-inside: |
+              class $CLS(...):
+                ...
+      # Config classes, unless clearly for development or tests.
+      - patterns:
+          - pattern-either:
+              - pattern: $SETTING = False
+              - pattern: '$SETTING: $TYPE = False'
+          - metavariable-regex:
+              metavariable: $SETTING
+              regex: ^(SESSION_COOKIE_SECURE|CSRF_COOKIE_SECURE|REMEMBER_COOKIE_SECURE|LANGUAGE_COOKIE_SECURE)$
+          - pattern-inside: |
+              class $CLS(...):
+                ...
+          - pattern-not-inside: |
+              def $FUNC(...):
+                ...
+          - metavariable-regex:
+              metavariable: $CLS
+              regex: (?i)^(?!.*(dev|test|local|debug)).*$
+      - patterns:
+          - pattern: $APP.config[$KEY] = False
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: ^["'](SESSION_COOKIE_SECURE|REMEMBER_COOKIE_SECURE)["']$
+      - pattern: $APP.config.update(..., SESSION_COOKIE_SECURE=False, ...)
+      - pattern: $APP.config.update(..., REMEMBER_COOKIE_SECURE=False, ...)
+
+  - id: py-cookie-httponly-disabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      The session cookie is explicitly configured without the HttpOnly flag,
+      so any JavaScript on the page, including an injected XSS payload, can
+      read and steal the session. Keep SESSION_COOKIE_HTTPONLY (and
+      REMEMBER_COOKIE_HTTPONLY) set to True, which is the framework default.
+    metadata:
+      cwe: "CWE-1004: Sensitive Cookie Without 'HttpOnly' Flag"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [django, flask]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "4.3"
+      references:
+        - https://docs.djangoproject.com/en/stable/ref/settings/#session-cookie-httponly
+        - https://owasp.org/www-community/HttpOnly
+        - https://cwe.mitre.org/data/definitions/1004.html
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $SETTING = False
+              - pattern: '$SETTING: $TYPE = False'
+          - metavariable-regex:
+              metavariable: $SETTING
+              regex: ^(SESSION_COOKIE_HTTPONLY|REMEMBER_COOKIE_HTTPONLY)$
+          - pattern-not-inside: |
+              def $FUNC(...):
+                ...
+      - patterns:
+          - pattern: $APP.config[$KEY] = False
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: ^["'](SESSION_COOKIE_HTTPONLY|REMEMBER_COOKIE_HTTPONLY)["']$
+      - pattern: $APP.config.update(..., SESSION_COOKIE_HTTPONLY=False, ...)
+      - pattern: $APP.config.update(..., REMEMBER_COOKIE_HTTPONLY=False, ...)
+
+  - id: py-csrf-protection-disabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      CSRF protection is disabled for this view or application. A malicious
+      site can make a logged-in user's browser submit state-changing requests
+      here. Remove the exemption; for a machine-to-machine webhook,
+      authenticate every request instead (for example with an HMAC signature
+      check).
+    metadata:
+      cwe: "CWE-352: Cross-Site Request Forgery (CSRF)"
+      owasp: "A01:2021 - Broken Access Control"
+      category: security
+      subcategory: [audit]
+      technology: [django, flask, flask-wtf]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      security-severity: "6.5"
+      references:
+        - https://docs.djangoproject.com/en/stable/ref/csrf/
+        - https://flask-wtf.readthedocs.io/en/stable/csrf/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+    patterns:
+      - pattern-either:
+          - pattern: django.views.decorators.csrf.csrf_exempt
+          - patterns:
+              - pattern: $CSRF.exempt
+              - metavariable-regex:
+                  metavariable: $CSRF
+                  regex: (?i).*csrf.*
+          - patterns:
+              - pattern-either:
+                  - pattern: WTF_CSRF_ENABLED = False
+                  - pattern: WTF_CSRF_CHECK_DEFAULT = False
+              - pattern-not-inside: |
+                  def $FUNC(...):
+                    ...
+              - pattern-not-inside: |
+                  class $CLS(...):
+                    ...
+          - patterns:
+              - pattern-either:
+                  - pattern: WTF_CSRF_ENABLED = False
+                  - pattern: WTF_CSRF_CHECK_DEFAULT = False
+              - pattern-inside: |
+                  class $CLS(...):
+                    ...
+              - pattern-not-inside: |
+                  def $FUNC(...):
+                    ...
+              - metavariable-regex:
+                  metavariable: $CLS
+                  regex: (?i)^(?!.*(dev|test|local|debug)).*$
+          - patterns:
+              - pattern-either:
+                  - pattern: $APP.config["WTF_CSRF_ENABLED"] = False
+                  - pattern: $APP.config.update(..., WTF_CSRF_ENABLED=False, ...)
+              - pattern-not: $APP.config.update(..., TESTING=True, ...)
+              - pattern-not-inside: |
+                  $APP.config["TESTING"] = True
+                  ...
+      # Webhooks that verify an HMAC signature authenticate every request.
+      - pattern-not-inside: |
+          @$DECORATOR
+          def $VIEW(...):
+            ...
+            if not hmac.compare_digest(...):
+              ...
+            ...
+
+  - id: py-cors-wildcard-credentials
+    languages: [python]
+    severity: ERROR
+    message: >-
+      CORS allows every origin while also allowing credentials, so the library
+      reflects any Origin header together with
+      Access-Control-Allow-Credentials: true. Any website can then read
+      authenticated responses from this API with the victim's cookies. List the
+      trusted origins explicitly whenever credentials are allowed.
+    metadata:
+      cwe: "CWE-942: Permissive Cross-domain Policy with Untrusted Domains"
+      owasp: "A05:2021 - Security Misconfiguration"
+      category: security
+      subcategory: [vuln]
+      technology: [flask-cors, fastapi, starlette, django-cors-headers]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      security-severity: "7.5"
+      references:
+        - https://portswigger.net/web-security/cors
+        - https://flask-cors.readthedocs.io/en/latest/api.html
+        - https://www.starlette.io/middleware/#corsmiddleware
+        - https://cwe.mitre.org/data/definitions/942.html
+    pattern-either:
+      # flask-cors: origins defaults to '*'.
+      - patterns:
+          - pattern-either:
+              - pattern: flask_cors.CORS(..., supports_credentials=True, ...)
+              - pattern: flask_cors.cross_origin(..., supports_credentials=True, ...)
+          - pattern-either:
+              - pattern: $CORS(..., origins="=~/^(\*|\.\*|\^\.\*\$?)$/", ...)
+              - pattern: $CORS(..., origins=[..., "=~/^(\*|\.\*|\^\.\*\$?)$/", ...], ...)
+              - pattern: '$CORS(..., resources={..., $ROUTE: {..., "origins": "*", ...}, ...}, ...)'
+              - patterns:
+                  - pattern: $CORS(...)
+                  - pattern-not: $CORS(..., origins=$ORIGINS, ...)
+                  - pattern-not: $CORS(..., resources=$RESOURCES, ...)
+      # Starlette / FastAPI CORSMiddleware.
+      - patterns:
+          - pattern-either:
+              - pattern: $APP.add_middleware($MW, ..., allow_credentials=True, ...)
+              - pattern: starlette.middleware.Middleware($MW, ..., allow_credentials=True, ...)
+          - metavariable-pattern:
+              metavariable: $MW
+              pattern-either:
+                - pattern: starlette.middleware.cors.CORSMiddleware
+                - pattern: fastapi.middleware.cors.CORSMiddleware
+          - pattern-either:
+              - pattern: $CALL(..., allow_origins=[..., "*", ...], ...)
+              - pattern: $CALL(..., allow_origins=("*", ...), ...)
+              - pattern: $CALL(..., allow_origin_regex="=~/^\^?\.[*+]\$?$/", ...)
+      # django-cors-headers.
+      - patterns:
+          - pattern-either:
+              - pattern: CORS_ALLOW_ALL_ORIGINS = True
+              - pattern: CORS_ORIGIN_ALLOW_ALL = True
+          - pattern-either:
+              - pattern-inside: |
+                  CORS_ALLOW_CREDENTIALS = True
+                  ...
+              - pattern-inside: |
+                  ...
+                  CORS_ALLOW_CREDENTIALS = True
