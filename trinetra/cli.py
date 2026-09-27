@@ -29,6 +29,7 @@ from trinetra.models.scope import OutOfScopeError
 from trinetra.orchestrator.pipeline import Pipeline, RunConfig
 from trinetra.providers.anthropic import AnthropicProvider
 from trinetra.providers.router import ProviderRouter
+from trinetra.reporting.render import FORMATS, write_reports
 
 app = typer.Typer(help="Trinetra — application security testing platform", no_args_is_help=True)
 console = Console()
@@ -124,6 +125,10 @@ def scan(
             "--learn/--no-learn", help="Self-evolving loop (needs Semgrep/Docker to promote)"
         ),
     ] = False,
+    report: Annotated[
+        list[str] | None,
+        typer.Option("--report", help="Also write a report: exec | cert-in | crest (repeatable)"),
+    ] = None,
 ) -> None:
     """Scan source (SAST+SCA), a URL (DAST), both (IAST), or an APK (Android) → SARIF."""
     if apk and (path or target):
@@ -137,6 +142,10 @@ def scan(
             "[bold red]Refused:[/] a --target (network) scan requires --scope pointing at a "
             "signed engagement manifest."
         )
+        raise typer.Exit(code=2)
+    bad = [r for r in (report or []) if r not in FORMATS]
+    if bad:
+        console.print(f"[bold red]Unknown report format(s):[/] {', '.join(bad)}. One of {FORMATS}.")
         raise typer.Exit(code=2)
 
     _register_default_engines(semgrep_config=semgrep_config)
@@ -184,6 +193,10 @@ def scan(
                 "[dim]Learner: no rules promoted (needs Semgrep + fixtures to validate; "
                 "the gate is fail-closed).[/]"
             )
+    if report:
+        paths = write_reports(result.findings, result.run_dir, report)
+        for p in paths:
+            console.print(f"[green]Report written:[/] {p}")
     engines_skipped = [e for e in result.skipped_engines if e != "ai_reviewer"]
     if engines_skipped:
         console.print(

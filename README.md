@@ -125,6 +125,25 @@ but only after it proves itself, so precision is measured, never assumed.
 
 Later phases add audit-grade reporting (CERT-In/CREST) and the live dashboard.
 
+## What's new (Phase 7 — audit reporting + dashboard)
+
+Turns findings into a report you can hand to a client or auditor, with tamper-evident evidence:
+
+- **Evidence chain-of-custody** — each finding's request/response, OAST token and steps are
+  captured and hashed (SHA-256). The hash is what a report cites; change any evidence field and
+  the hash changes, so a reviewer can re-verify it.
+- **Report templates** — `--report exec`, `--report cert-in`, `--report crest` render an
+  executive summary or a structured CERT-In / CREST engagement report (Markdown, converts cleanly
+  to PDF/HTML). Repeatable, written alongside the SARIF in the run directory.
+- **Live activity model + manual replay** — the data layer behind a live scan view: a
+  category-wise activity log, and a `fork()` that clones a captured request with a tweaked
+  payload for manual re-testing (without mutating the original).
+
+> The report templates organize real findings and their evidence hashes; they are structural
+> layouts, not a legal certification of compliance. The live browser dashboard ships as an
+> optional extra (`trinetra[dashboard]`, FastAPI); its activity/replay core is built and tested
+> here, the running server is opt-in.
+
 ## Prerequisites
 
 - **Python 3.12+**
@@ -152,6 +171,9 @@ python -m trinetra scan --path ./target --target http://localhost:3000 \
 
 # Android: statically analyze an APK (manifest flaws + hardcoded secrets):
 python -m trinetra scan --apk ./app.apk
+
+# Write an auditor-ready report alongside the SARIF:
+python -m trinetra scan --path ./target --report exec --report cert-in
 ```
 
 DAST engines (ZAP, Nuclei) run against a live URL, so they need the pinned engine
