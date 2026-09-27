@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 # The Anthropic adapter is the first concrete provider; others plug in behind the same interface.
 llm = ["anthropic>=0.40"]
+# The live activity dashboard (optional): FastAPI + websocket server.
+dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
