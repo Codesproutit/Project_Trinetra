@@ -1,37 +1,99 @@
-"""Optional live dashboard server (FastAPI + websocket).
+"""Local control-panel server (optional FastAPI).
 
-FastAPI is an optional dependency and the browser UI needs a running process, so
-this module imports FastAPI lazily and exposes `available()`. The activity model
-(activity.py) and replay logic (replay.py) are the tested core; this is the thin
-transport that streams them to a browser when the extra is installed.
+`trinetra serve` starts this on localhost. It is a thin transport over the tested
+core: `environment.py` says what can run, `jobs.py` runs scans on background
+threads, and this module just exposes them plus the static page. FastAPI and
+uvicorn are optional (`pip install trinetra[dashboard]`), imported lazily so the
+rest of Trinetra runs without them.
 """
 
 from __future__ import annotations
 
-from trinetra.dashboard.activity import ActivityLog
+from dataclasses import asdict
+from pathlib import Path
+
+from trinetra.dashboard.environment import mode_readiness, probe_environment
+from trinetra.dashboard.jobs import JobManager, ScanRequest
+
+STATIC_DIR = Path(__file__).parent / "static"
 
 
 def available() -> bool:
     try:
         import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
     except ModuleNotFoundError:
         return False
     return True
 
 
-def create_app(log: ActivityLog):  # pragma: no cover - needs fastapi installed
-    """Build a FastAPI app that serves the activity log. Requires trinetra[dashboard]."""
+def _require() -> None:
     if not available():
         raise RuntimeError(
-            "FastAPI is not installed. Install with `pip install trinetra[dashboard]` "
-            "to run the live dashboard."
+            "FastAPI/uvicorn are not installed. Install with `pip install trinetra[dashboard]` "
+            "to run the local control panel."
         )
-    from fastapi import FastAPI
 
-    app = FastAPI(title="Trinetra activity")
 
-    @app.get("/api/activity")
-    def activity() -> list[dict]:
-        return log.to_list()
+def create_app(job_manager: JobManager | None = None):
+    """Build the FastAPI app. A JobManager can be injected for tests."""
+    _require()
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
+
+    jobs = job_manager or JobManager()
+    app = FastAPI(title="Trinetra control panel", docs_url="/api/docs")
+
+    @app.get("/api/environment")
+    def environment() -> JSONResponse:
+        env = probe_environment()
+        return JSONResponse(
+            {
+                "capabilities": [asdict(c) for c in env.values()],
+                "modes": {k: asdict(v) for k, v in mode_readiness(env).items()},
+            }
+        )
+
+    @app.post("/api/scan")
+    def start_scan(request: ScanRequest) -> JSONResponse:
+        job = jobs.submit(request)
+        return JSONResponse(job.public(), status_code=202)
+
+    @app.get("/api/scan/{job_id}")
+    def scan_status(job_id: str) -> JSONResponse:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such scan")
+        return JSONResponse(job.public())
+
+    @app.get("/api/scans")
+    def list_scans() -> JSONResponse:
+        return JSONResponse([j.public() for j in jobs.list()])
+
+    @app.get("/api/file")
+    def get_file(path: str):
+        """Serve a report/SARIF file, but only one an actual scan produced."""
+        allowed: set[str] = set()
+        for j in jobs.list():
+            if j.sarif_path:
+                allowed.add(j.sarif_path)
+            allowed.update(j.report_paths or [])
+        if path not in allowed:
+            raise HTTPException(status_code=403, detail="not a result of any scan")
+        if not Path(path).is_file():
+            raise HTTPException(status_code=404, detail="file is gone")
+        return FileResponse(path)
+
+    if STATIC_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
     return app
+
+
+def serve(host: str = "127.0.0.1", port: int = 8787) -> None:  # pragma: no cover - runs a server
+    """Run the control panel. Binds to localhost only by default."""
+    _require()
+    import uvicorn
+
+    uvicorn.run(create_app(), host=host, port=port)

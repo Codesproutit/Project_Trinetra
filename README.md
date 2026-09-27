@@ -144,6 +144,24 @@ Turns findings into a report you can hand to a client or auditor, with tamper-ev
 > optional extra (`trinetra[dashboard]`, FastAPI); its activity/replay core is built and tested
 > here, the running server is opt-in.
 
+## Control panel (point-and-click, no commands)
+
+Prefer buttons to a terminal? Start the local control panel and drive Trinetra from your browser:
+
+```bash
+pip install -e ".[dashboard]"
+python -m trinetra serve            # then open http://127.0.0.1:8787
+```
+
+The page lets you pick a scan type (source code, dependencies, a web/API target, or an Android
+APK), fill in the path or URL, build a scope file for web scans without hand-writing YAML, toggle
+the AI pass and self-learning, and press **Run**. It shows live progress, then lists findings by
+severity with links to download the SARIF and reports. It binds to `127.0.0.1` only, and it is
+honest about limits: any engine whose tool is missing (Semgrep, ZAP/Nuclei, apktool, Docker) or
+whose API key is unset shows a clear "needs X" state instead of silently finding nothing. Watching
+a browser drive an attack live is not part of this panel yet — it runs the existing pipeline in the
+background and reports what it found.
+
 ## Prerequisites
 
 - **Python 3.12+**
