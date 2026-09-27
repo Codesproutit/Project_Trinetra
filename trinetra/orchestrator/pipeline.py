@@ -28,6 +28,7 @@ from trinetra.engines.base import EngineRegistry
 from trinetra.engines.base import registry as default_registry
 from trinetra.engines.oast import NullOastBackend, OastListener
 from trinetra.iast.bridge import correlate, derive_tasks, mint_oast_callbacks
+from trinetra.learner import Learner
 from trinetra.models.finding import Finding
 from trinetra.models.scope import (
     OutOfScopeError,
@@ -106,6 +107,7 @@ class RunResult:
     ai_reviewed: int = 0  # findings sent through the AI cognitive pass
     ai_dropped: int = 0  # confirmed false positives the AI removed
     cost_usd: float = 0.0  # LLM spend for this run
+    rules_promoted: int = 0  # new brain rules learned this run
 
 
 def dedup(findings: list[Finding]) -> list[Finding]:
@@ -126,6 +128,7 @@ class Pipeline:
         engine_registry: EngineRegistry | None = None,
         oast: OastListener | None = None,
         reviewer: AiReviewer | None = None,
+        learner: Learner | None = None,
     ):
         self.settings = settings or load_settings()
         self.registry = engine_registry or default_registry
@@ -134,6 +137,8 @@ class Pipeline:
         self.oast = oast or OastListener(backend=NullOastBackend())
         # The AI cognitive pass is opt-in (BYOK). None => deterministic-only run.
         self.reviewer = reviewer
+        # The self-evolving learner is opt-in. None => no rule promotion.
+        self.learner = learner
 
     def _build_guard(self, cfg: RunConfig) -> ScopeGuard:
         if cfg.scope_manifest:
@@ -251,7 +256,17 @@ class Pipeline:
                 cost_usd = router_cost(self.reviewer.router).usd
             else:
                 skipped.append("ai_reviewer")
-        # >>> Later phases hook in here: learner.
+
+        # Self-evolving loop (opt-in): novel CONFIRMED findings become candidate
+        # rules, gated by the sandbox validator, promoted into the discipline brain.
+        rules_promoted = 0
+        if self.learner is not None:
+            try:
+                outcome = self.learner.observe(findings)
+                rules_promoted = len(outcome.promoted)
+            except Exception:  # noqa: BLE001 - learning must not fail the scan
+                logger.exception("Learner failed; scan results unaffected")
+                failed.append("learner")
 
         store = RunStore(self.settings.run_dir)
         store.write_findings(findings)
@@ -267,6 +282,7 @@ class Pipeline:
             ai_reviewed=ai_reviewed,
             ai_dropped=ai_dropped,
             cost_usd=cost_usd,
+            rules_promoted=rules_promoted,
         )
 
 

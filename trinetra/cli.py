@@ -16,12 +16,14 @@ from rich.table import Table
 
 from trinetra import __version__
 from trinetra.ai import AiReviewer
+from trinetra.brains import FileBrain
 from trinetra.engines.base import registry
 from trinetra.engines.dast.nuclei import NucleiAdapter
 from trinetra.engines.dast.zap import ZapAdapter
 from trinetra.engines.mobile.android import ApkStaticAdapter
 from trinetra.engines.sast.semgrep import SemgrepAdapter
 from trinetra.engines.sca.sca_scanner import ScaScanner
+from trinetra.learner import Learner, SandboxValidator, SemgrepRuleRunner
 from trinetra.models.finding import Severity
 from trinetra.models.scope import OutOfScopeError
 from trinetra.orchestrator.pipeline import Pipeline, RunConfig
@@ -59,6 +61,22 @@ def _build_reviewer() -> AiReviewer:
     """Construct the AI reviewer for the configured provider (Anthropic first)."""
     provider = AnthropicProvider()
     return AiReviewer(ProviderRouter(provider))
+
+
+def _build_learner(disciplines: list[str]) -> Learner:
+    """Wire the self-evolving learner: a brain per discipline + the sandbox gate.
+
+    The gate uses a local Semgrep runner; without Semgrep/Docker present it reports
+    'skipped' and the loop promotes nothing (fail-closed).
+    """
+    brains_root = ".trinetra/brains"
+    brains = {d: FileBrain(d, brains_root) for d in disciplines}
+    validator = SandboxValidator(
+        SemgrepRuleRunner(),
+        positive_dir=f"{brains_root}/fixtures/vulnerable",
+        negative_dir=f"{brains_root}/fixtures/remediated",
+    )
+    return Learner(brains, validator)
 
 
 @app.command()
@@ -100,6 +118,12 @@ def scan(
         bool,
         typer.Option("--ai/--no-ai", help="Run the AI cognitive pass (BYOK; needs an API key)"),
     ] = False,
+    learn: Annotated[
+        bool,
+        typer.Option(
+            "--learn/--no-learn", help="Self-evolving loop (needs Semgrep/Docker to promote)"
+        ),
+    ] = False,
 ) -> None:
     """Scan source (SAST+SCA), a URL (DAST), both (IAST), or an APK (Android) → SARIF."""
     if apk and (path or target):
@@ -116,15 +140,19 @@ def scan(
         raise typer.Exit(code=2)
 
     _register_default_engines(semgrep_config=semgrep_config)
+    disciplines = discipline or (["android"] if apk else ["web"])
     cfg = RunConfig(
         source_path=path,
         target_url=target,
         apk_path=apk,
-        disciplines=discipline or (["android"] if apk else ["web"]),
+        disciplines=disciplines,
         engines=engine,
         scope_manifest=scope,
     )
-    pipeline = Pipeline(reviewer=_build_reviewer() if ai else None)
+    pipeline = Pipeline(
+        reviewer=_build_reviewer() if ai else None,
+        learner=_build_learner(disciplines) if learn else None,
+    )
     try:
         result = pipeline.run(cfg)
     except OutOfScopeError as exc:
@@ -148,6 +176,14 @@ def scan(
             "[dim]AI pass skipped: no API key reachable. Set ANTHROPIC_API_KEY and "
             "install trinetra[llm], or drop --ai.[/]"
         )
+    if learn:
+        if result.rules_promoted:
+            console.print(f"[cyan]Learner:[/] promoted {result.rules_promoted} new rule(s).")
+        else:
+            console.print(
+                "[dim]Learner: no rules promoted (needs Semgrep + fixtures to validate; "
+                "the gate is fail-closed).[/]"
+            )
     engines_skipped = [e for e in result.skipped_engines if e != "ai_reviewer"]
     if engines_skipped:
         console.print(
