@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trinetra control panel</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171d2b; --line: #2a3346; --text: #e6ebf5;
+    --muted: #9aa7c0; --accent: #5b8cff; --accent-ink: #fff;
+    --crit: #ff5c7a; --high: #ff8a5c; --med: #ffce54; --low: #5bc0ff; --info: #9aa7c0;
+    --ok: #46d19e; --warn: #ffce54;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 18px 22px; border-bottom: 1px solid var(--line); display: flex;
+    align-items: baseline; gap: 12px; }
+  header h1 { font-size: 19px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 22px; display: grid;
+    grid-template-columns: 380px 1fr; gap: 22px; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+  input[type=text], select { width: 100%; padding: 9px 10px; background: #0e1320;
+    border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-size: 14px; }
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .mode { border: 1px solid var(--line); border-radius: 9px; padding: 10px; cursor: pointer;
+    background: #0e1320; }
+  .mode.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .mode .t { font-weight: 600; font-size: 14px; }
+  .mode .d { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .mode.blocked { opacity: .6; }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .row input[type=checkbox] { width: 16px; height: 16px; }
+  .toggle-label { font-size: 14px; color: var(--text); margin: 0; }
+  button.run { margin-top: 18px; width: 100%; padding: 12px; border: 0; border-radius: 9px;
+    background: var(--accent); color: var(--accent-ink); font-size: 15px; font-weight: 600;
+    cursor: pointer; }
+  button.run:disabled { background: #33405c; cursor: not-allowed; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .needs { color: var(--warn); }
+  .hidden { display: none; }
+  .status { font-size: 14px; margin-bottom: 12px; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite;
+    vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .counts { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .pill { padding: 4px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; color: #10131c; }
+  .pill.critical { background: var(--crit); } .pill.high { background: var(--high); }
+  .pill.medium { background: var(--med); } .pill.low { background: var(--low); }
+  .pill.info { background: var(--info); }
+  .finding { border: 1px solid var(--line); border-radius: 9px; padding: 12px; margin-bottom: 10px; }
+  .finding .head { display: flex; gap: 8px; align-items: center; }
+  .tag { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px; color: #10131c; }
+  .finding h3 { font-size: 14px; margin: 0; flex: 1; }
+  .finding .loc { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-all; }
+  .finding .desc { font-size: 13px; margin-top: 6px; color: #cdd6ea; }
+  .banner { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .banner.warn { background: #34290c; color: var(--warn); border: 1px solid #5c4a1a; }
+  .banner.err { background: #351720; color: var(--crit); border: 1px solid #5c2233; }
+  .links a { color: var(--accent); font-size: 13px; margin-right: 14px; }
+  .empty { color: var(--muted); font-size: 14px; }
+  code { background: #0e1320; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Trinetra</h1>
+  <span class="sub">control panel · runs on your machine, nothing leaves it unless you scan a URL</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>1. What do you want to scan?</h2>
+    <div class="modes" id="modes"></div>
+    <div id="mode-hint" class="hint"></div>
+
+    <div id="field-path">
+      <label id="path-label">Folder or file to scan</label>
+      <input type="text" id="path" placeholder="C:\path\to\your\project">
+    </div>
+
+    <div id="field-target" class="hidden">
+      <label>Web address to test</label>
+      <input type="text" id="target" placeholder="https://your-authorized-site.example">
+      <div class="panel" style="margin-top:12px;background:#0e1320">
+        <h2>Permission (required for web scans)</h2>
+        <div class="hint">Only a site you are authorized to test. This builds the scope file for you.</div>
+        <label>Authorized host</label>
+        <input type="text" id="scope-host" placeholder="your-authorized-site.example">
+        <label>Max requests per second</label>
+        <input type="text" id="scope-rps" value="5">
+        <label>Off-limits paths (optional, one per line)</label>
+        <input type="text" id="scope-exclude" placeholder="https://host/admin/*">
+      </div>
+    </div>
+
+    <h2 style="margin-top:18px">2. Options</h2>
+    <div class="row">
+      <input type="checkbox" id="opt-ai">
+      <label class="toggle-label" for="opt-ai">AI review pass <span id="ai-needs" class="needs"></span></label>
+    </div>
+    <div class="row">
+      <input type="checkbox" id="opt-learn">
+      <label class="toggle-label" for="opt-learn">Self-learning <span id="learn-needs" class="needs"></span></label>
+    </div>
+    <div class="row">
+      <input type="checkbox" id="opt-report" checked>
+      <label class="toggle-label" for="opt-report">Also write an executive report</label>
+    </div>
+
+    <button class="run" id="run">Run scan</button>
+    <div id="run-hint" class="hint"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Results</h2>
+    <div id="results"><div class="empty">Pick a scan, fill in the details, and press Run.</div></div>
+  </section>
+</main>
+
+<script>
+const MODES = [
+  { key: "source", t: "Source code", d: "Find bugs in your code" },
+  { key: "dependencies", t: "Dependencies", d: "Known holes in libraries" },
+  { key: "target", t: "Website / API", d: "Test a running site" },
+  { key: "apk", t: "Android app", d: "Scan an .apk file" },
+];
+const SEV_ORDER = ["critical", "high", "medium", "low", "info"];
+let mode = "source";
+let modeInfo = {};
+let poll = null;
+
+const $ = (id) => document.getElementById(id);
+
+function renderModes() {
+  $("modes").innerHTML = "";
+  for (const m of MODES) {
+    const info = modeInfo[m.key] || { ready: true, blockers: [] };
+    const el = document.createElement("div");
+    el.className = "mode" + (m.key === mode ? " active" : "") + (info.ready ? "" : " blocked");
+    el.innerHTML = `<div class="t">${m.t}</div><div class="d">${m.d}</div>`;
+    el.onclick = () => { mode = m.key; renderModes(); syncFields(); };
+    $("modes").appendChild(el);
+  }
+  syncFields();
+}
+
+function syncFields() {
+  const isTarget = mode === "target";
+  $("field-target").classList.toggle("hidden", !isTarget);
+  $("field-path").classList.toggle("hidden", isTarget);
+  const labels = { source: "Folder or file to scan", dependencies: "Project folder (has requirements.txt, package.json, lockfiles)", apk: "Path to the .apk file" };
+  $("path-label").textContent = labels[mode] || "Path";
+  const info = modeInfo[mode] || { ready: true, blockers: [] };
+  $("mode-hint").innerHTML = info.ready ? "" :
+    `<span class="needs">Heads up: ${info.blockers.join("; ")}</span>`;
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function loadEnv() {
+  try {
+    const r = await fetch("/api/environment");
+    const data = await r.json();
+    modeInfo = data.modes || {};
+    const caps = {};
+    for (const c of data.capabilities || []) caps[c.key] = c;
+    if (caps.ai && !caps.ai.available) { $("ai-needs").textContent = "(needs API key)"; $("opt-ai").disabled = true; }
+    if (caps.docker && !caps.docker.available) { $("learn-needs").textContent = "(needs Docker)"; }
+  } catch (e) { /* page still works; modes default to ready */ }
+  renderModes();
+}
+
+function buildRequest() {
+  const req = { mode, ai: $("opt-ai").checked, learn: $("opt-learn").checked,
+                reports: $("opt-report").checked ? ["exec"] : [] };
+  if (mode === "target") {
+    req.target_url = $("target").value.trim();
+    req.scope = {
+      host: $("scope-host").value.trim(),
+      rate_limit_rps: parseFloat($("scope-rps").value) || 5,
+      out_of_scope: $("scope-exclude").value.split("\n").map(s => s.trim()).filter(Boolean),
+    };
+  } else {
+    req.path = $("path").value.trim();
+  }
+  return req;
+}
+
+async function run() {
+  const req = buildRequest();
+  $("run").disabled = true;
+  $("run-hint").textContent = "";
+  $("results").innerHTML = `<div class="status"><span class="spinner"></span>Starting…</div>`;
+  let res;
+  try {
+    res = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req) });
+  } catch (e) { fail("Could not reach the scanner."); return; }
+  if (res.status === 422) {
+    const d = await res.json().catch(() => ({}));
+    fail(explainValidation(d)); return;
+  }
+  const job = await res.json();
+  pollJob(job.id);
+}
+
+function explainValidation(d) {
+  try { return d.detail.map(e => e.msg.replace(/^Value error, /, "")).join("; "); }
+  catch { return "Please check the form and try again."; }
+}
+
+function fail(msg) {
+  $("results").innerHTML = `<div class="banner err">${esc(msg)}</div>`;
+  $("run").disabled = false;
+}
+
+function pollJob(id) {
+  if (poll) clearInterval(poll);
+  poll = setInterval(async () => {
+    let job;
+    try { job = await (await fetch("/api/scan/" + id)).json(); }
+    catch { return; }
+    if (job.status === "queued" || job.status === "running") {
+      $("results").innerHTML = `<div class="status"><span class="spinner"></span>Scanning… this can take a little while.</div>`;
+      return;
+    }
+    clearInterval(poll); poll = null;
+    $("run").disabled = false;
+    if (job.status === "refused") { $("results").innerHTML = `<div class="banner err">Refused: ${esc(job.message)}</div>`; return; }
+    if (job.status === "error") { $("results").innerHTML = `<div class="banner err">Something went wrong: ${esc(job.message)}</div>`; return; }
+    renderResults(job);
+  }, 1000);
+}
+
+function renderResults(job) {
+  const s = job.summary || {};
+  let html = "";
+  const skipped = (s.skipped_engines || []);
+  const failed = (s.failed_engines || []);
+  if (failed.length) html += `<div class="banner err">Some engines failed: ${esc(failed.join(", "))}. Results may be incomplete.</div>`;
+  if (skipped.length) html += `<div class="banner warn">Skipped (not installed here): ${esc(skipped.join(", "))}.</div>`;
+
+  const counts = s.by_severity || {};
+  html += `<div class="counts">`;
+  html += `<span class="pill info">${s.total || 0} total</span>`;
+  for (const sev of SEV_ORDER) if (counts[sev]) html += `<span class="pill ${sev}">${counts[sev]} ${sev}</span>`;
+  html += `</div>`;
+
+  const links = [];
+  if (job.sarif_path) links.push(`<a href="/api/file?path=${encodeURIComponent(job.sarif_path)}" target="_blank">Download SARIF report</a>`);
+  for (const p of (job.report_paths || [])) links.push(`<a href="/api/file?path=${encodeURIComponent(p)}" target="_blank">Download report</a>`);
+  if (links.length) html += `<div class="links" style="margin-bottom:14px">${links.join("")}</div>`;
+
+  const findings = (job.findings || []).slice().sort((a, b) =>
+    SEV_ORDER.indexOf(a.severity) - SEV_ORDER.indexOf(b.severity));
+  if (!findings.length) {
+    html += `<div class="empty">No issues found${skipped.length ? " (some checks were skipped, see above)" : ""}.</div>`;
+  }
+  for (const f of findings) {
+    const loc = [f.location && f.location.file, f.location && f.location.line].filter(Boolean).join(":")
+      || (f.location && f.location.route) || "";
+    html += `<div class="finding"><div class="head">
+      <span class="tag pill ${f.severity}">${esc(f.severity)}</span>
+      <h3>${esc(f.title)}</h3></div>
+      ${loc ? `<div class="loc">${esc(loc)}</div>` : ""}
+      ${f.cwe ? `<div class="loc">${esc(f.cwe)}${f.owasp ? " · " + esc(f.owasp) : ""}</div>` : ""}
+      <div class="desc">${esc(f.description || "").slice(0, 400)}</div></div>`;
+  }
+  $("results").innerHTML = html;
+}
+
+$("run").onclick = run;
+loadEnv();
+</script>
+</body>
+</html>

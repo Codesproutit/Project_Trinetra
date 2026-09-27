@@ -87,6 +87,26 @@ def version() -> None:
 
 
 @app.command()
+def serve(
+    host: Annotated[str, typer.Option("--host", help="Address to bind")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port to serve on")] = 8787,
+) -> None:
+    """Open the local control panel in your browser (point-and-click scanning)."""
+    from trinetra.dashboard import server
+
+    if not server.available():
+        console.print(
+            "[bold red]The control panel needs its web extras.[/] Install them with "
+            "[cyan]pip install trinetra\\[dashboard][/], then run [cyan]trinetra serve[/] again."
+        )
+        raise typer.Exit(code=2)
+    url = f"http://{host}:{port}"
+    console.print(f"[green]Trinetra control panel:[/] open [bold]{url}[/] in your browser.")
+    console.print("[dim]Press Ctrl+C to stop.[/]")
+    server.serve(host=host, port=port)
+
+
+@app.command()
 def scan(
     path: Annotated[
         str | None, typer.Option("--path", "-p", help="Source path to scan (SAST + SCA)")
