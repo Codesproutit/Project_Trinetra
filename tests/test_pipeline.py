@@ -137,11 +137,13 @@ def test_pipeline_skips_unavailable_engine(tmp_path):
     assert "down" in result.skipped_engines
 
 
-def test_runconfig_requires_exactly_one_input():
+def test_runconfig_requires_at_least_one_input():
     with pytest.raises(ValueError):
         RunConfig()
-    with pytest.raises(ValueError):
-        RunConfig(source_path="x", target_url="http://y/")
+    # Both together is valid — that's IAST (grey-box) mode.
+    assert RunConfig(source_path="x", target_url="http://y/").mode == "iast"
+    assert RunConfig(source_path="x").mode == "source"
+    assert RunConfig(target_url="http://y/").mode == "target"
 
 
 def test_target_mode_requires_scope_manifest(tmp_path):
@@ -198,3 +200,38 @@ def test_target_mode_polls_oast_and_merges_findings(tmp_path):
         RunConfig(target_url="http://testapp.local/", disciplines=["web"], scope_manifest=scope)
     )
     assert any(f.source == "oast" and f.cwe == "CWE-918" for f in result.findings)
+
+
+def test_iast_mode_confirms_static_sink_from_dynamic_finding(tmp_path):
+    from trinetra.models.finding import Confidence, Location
+
+    static_sqli = Finding(
+        discipline="web", source="semgrep", title="SQLi sink", rule_id="sqli",
+        severity=Severity.HIGH, confidence=Confidence.THEORETICAL, cwe="CWE-89",
+        location=Location(file="app/db.py", line=10),
+    )
+    dynamic_sqli = Finding(
+        discipline="web", source="zap", title="SQLi confirmed", rule_id="dyn-sqli",
+        severity=Severity.HIGH, confidence=Confidence.CONFIRMED, cwe="CWE-89",
+        location=Location(route="http://testapp.local/item"),
+    )
+    reg = EngineRegistry()
+    reg.register(_FakeEngine([static_sqli]))  # source engine
+    reg.register(_FakeTargetEngine([dynamic_sqli]))  # target engine
+    settings = Settings(run_dir=tmp_path / "runs")
+    src = tmp_path / "src"
+    src.mkdir()
+    scope = _write_scope(tmp_path, "testapp.local")
+
+    result = Pipeline(settings=settings, engine_registry=reg).run(
+        RunConfig(
+            source_path=str(src),
+            target_url="http://testapp.local/",
+            disciplines=["web"],
+            scope_manifest=scope,
+        )
+    )
+    assert result.verification_tasks == 1  # the static SQLi sink was queued
+    assert result.iast_confirmed == 1
+    upgraded = next(f for f in result.findings if f.source == "semgrep")
+    assert upgraded.confidence == Confidence.CONFIRMED

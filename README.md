@@ -43,6 +43,25 @@ Dynamic scanning of a running target, feeding the same `Finding` schema, dedup, 
 Later phases add the IAST bridge, the AI cognitive pass, the Android track, and the
 self-evolving learner with a Docker validation gate.
 
+## What's new (Phase 3 — IAST bridge)
+
+The bridge fuses the static and dynamic layers, so a code-level candidate and runtime proof
+land in **one** finding:
+
+- **Verification queue** — every injectable static sink (SQLi, command injection, SSRF, XXE,
+  code injection, XSS…) becomes a prioritized task for the dynamic scan, tagged with the
+  vulnerability class to probe.
+- **Out-of-band hooks** — blind classes (SSRF, blind RCE/SQLi) get an OAST callback minted per
+  sink, so an out-of-band hit ties straight back to the exact code location.
+- **Confirmation** — after the dynamic scan runs, a static candidate whose class the scan
+  confirmed is upgraded from *theoretical* to **confirmed**, with the dynamic evidence attached.
+  That is the IAST result: reachable, exploitable, and pinned to a line of code.
+- **Grey-box run** — pass both `--path` and `--target` to run SAST, then DAST, then the
+  correlation in one pass. Source-only and target-only modes are unchanged.
+
+Later phases add the AI cognitive pass, the Android track, and the self-evolving learner with a
+Docker validation gate.
+
 ## Prerequisites
 
 - **Python 3.12+**
@@ -63,6 +82,10 @@ python -m trinetra scan --path ./target --scope examples/scope.example.yaml
 
 # DAST: scan a running target you are authorized to test (requires --scope):
 python -m trinetra scan --target http://localhost:3000 --scope examples/scope.example.yaml
+
+# IAST (grey-box): SAST + DAST in one pass, correlating static sinks with runtime proof:
+python -m trinetra scan --path ./target --target http://localhost:3000 \
+    --scope examples/scope.example.yaml
 ```
 
 DAST engines (ZAP, Nuclei) run against a live URL, so they need the pinned engine
