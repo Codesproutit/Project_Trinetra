@@ -15,6 +15,9 @@ from trinetra.models.finding import Finding
 class EngineAdapter(Protocol):
     name: str
     disciplines: list[str]
+    # "source" engines take a local path (SAST/SCA); "target" engines take a URL
+    # (DAST). The pipeline routes by this so a URL scan never invokes a SAST engine.
+    input_kind: str
 
     def available(self) -> bool:
         """True if this engine can actually run here (binary/daemon present)."""
@@ -37,6 +40,13 @@ class EngineRegistry:
 
     def for_discipline(self, discipline: str) -> list[EngineAdapter]:
         return [e for e in self._engines.values() if discipline in e.disciplines]
+
+    def select(self, discipline: str, input_kind: str) -> list[EngineAdapter]:
+        return [
+            e
+            for e in self._engines.values()
+            if discipline in e.disciplines and getattr(e, "input_kind", "source") == input_kind
+        ]
 
     def all(self) -> list[EngineAdapter]:
         return list(self._engines.values())

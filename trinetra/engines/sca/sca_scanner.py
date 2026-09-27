@@ -125,6 +125,7 @@ def osv_vulns_to_findings(pkg: Package, vulns: list[dict], *, discipline: str) -
 class ScaScanner:
     name = "sca"
     disciplines = ["web", "api"]
+    input_kind = "source"
 
     def __init__(self, client: PostClient | None = None):
         self._client = client

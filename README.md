@@ -23,8 +23,25 @@ This is the first working slice — the foundation plus a runnable SAST + SCA sc
 - **BYOK provider layer** — the Anthropic (Claude) adapter behind a generic interface;
   OpenAI/Gemini/local plug in next. (The AI cognitive pass itself lands in a later phase.)
 
-Later phases add the DAST core (ZAP/Nuclei), the OAST listener, the IAST bridge, the AI
-cognitive pass, the Android track, and the self-evolving learner with a Docker validation gate.
+## What's new (Phase 2 — DAST core)
+
+Dynamic scanning of a running target, feeding the same `Finding` schema, dedup, and SARIF:
+
+- **DAST** — OWASP ZAP adapter (spider → active scan → alerts over the ZAP REST API) and a
+  Nuclei adapter (template checks, JSONL output). Both are `input_kind="target"` engines.
+- **OAST** — an out-of-band listener that mints a unique callback host per injection point and
+  correlates received DNS/HTTP callbacks into **confirmed** blind-vuln findings (blind
+  SSRF/RCE/SQLi, CWE-918). Pluggable backend; a null backend keeps it inert when no interaction
+  server is configured.
+- **`--target <url>` mode** — the orchestrator routes by `input_kind`, so a URL scan runs only
+  the dynamic engines (and never a SAST engine), and a source scan never touches the network.
+- **Graceful degradation** — if the ZAP daemon or the `nuclei` binary isn't present, that engine
+  reports *skipped* instead of crashing the run.
+- **Deny-by-default for network targets** — a `--target` scan is refused unless you pass
+  `--scope` pointing at a signed engagement manifest.
+
+Later phases add the IAST bridge, the AI cognitive pass, the Android track, and the
+self-evolving learner with a Docker validation gate.
 
 ## Prerequisites
 
@@ -43,7 +60,14 @@ python -m trinetra scan --path examples/vulnerable-python --discipline web
 
 # Enforce a signed scope manifest:
 python -m trinetra scan --path ./target --scope examples/scope.example.yaml
+
+# DAST: scan a running target you are authorized to test (requires --scope):
+python -m trinetra scan --target http://localhost:3000 --scope examples/scope.example.yaml
 ```
+
+DAST engines (ZAP, Nuclei) run against a live URL, so they need the pinned engine
+container/daemon present; without it they report *skipped*. Point `--target` only at systems
+your scope manifest authorizes.
 
 The scan writes a SARIF report and a `findings.json` under `.trinetra/runs/<timestamp>/`.
 

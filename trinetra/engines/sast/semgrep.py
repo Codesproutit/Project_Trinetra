@@ -120,6 +120,7 @@ def parse_semgrep_sarif(sarif: dict, *, discipline: str = "web") -> list[Finding
 class SemgrepAdapter:
     name = "semgrep"
     disciplines = ["web", "api"]
+    input_kind = "source"
 
     def __init__(self, config: str = "auto"):
         self.config = config
