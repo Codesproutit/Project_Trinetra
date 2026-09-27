@@ -176,6 +176,26 @@ python -m trinetra scan --apk ./app.apk
 python -m trinetra scan --path ./target --report exec --report cert-in
 ```
 
+### Static rules (SAST)
+
+By default Semgrep runs Trinetra's **bundled offline rules** (`trinetra/rules/`): Python
+(Flask/Django), JavaScript/TypeScript (Node/Express/React) and leaked-credential formats in any
+file. They cover SQL/command/code/template injection, taint-tracked path traversal, SSRF, open
+redirect and reflected XSS, insecure deserialization, XXE, weak hashing, disabled TLS/JWT
+verification, predictable tokens, debug mode and hardcoded secrets. No code or metrics leave the
+machine. Each rule is tagged with CWE + OWASP and has positive and negative test cases in
+`tests/semgrep_targets/`, enforced by `semgrep --test` in the test suite.
+
+`--semgrep-config` is repeatable. Add the online registry for broader coverage:
+
+```bash
+python -m trinetra scan --path ./target --semgrep-config bundled --semgrep-config p/owasp-top-ten
+```
+
+Rules the learner has promoted into a discipline's brain (`.trinetra/brains/<discipline>/`) run
+automatically on every scan, in a separate Semgrep pass, so a faulty learned rule can never break
+the base scan.
+
 DAST engines (ZAP, Nuclei) run against a live URL, so they need the pinned engine
 container/daemon present; without it they report *skipped*. Point `--target` only at systems
 your scope manifest authorizes.

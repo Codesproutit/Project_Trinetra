@@ -49,4 +49,4 @@ rules:
       - pattern: $NAME = "..."
       - metavariable-regex:
           metavariable: $NAME
-          regex: (?i)(password|passwd|secret|api_?key|token|access_?key)
+          regex: (?i).*(password|passwd|secret|api_?key|token|access_?key).*

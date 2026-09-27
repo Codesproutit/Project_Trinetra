@@ -1,0 +1,290 @@
+# Trinetra bundled JavaScript/TypeScript ruleset (offline, no registry needed).
+# Positive/negative cases live in tests/semgrep_targets/javascript.js.
+rules:
+  - id: trinetra.js.code-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Code injection: eval()/new Function()/string setTimeout run a non-constant
+      value as code. Parse data with JSON.parse and never execute input.
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: new Function(..., $X)
+          - pattern: setTimeout($X, ...)
+          - pattern: setInterval($X, ...)
+      - pattern-not: eval("...")
+      - pattern-not: new Function(..., "...")
+      - pattern-not: setTimeout(function (...) { ... }, ...)
+      - pattern-not: setTimeout((...) => $B, ...)
+      - pattern-not: setInterval(function (...) { ... }, ...)
+      - pattern-not: setInterval((...) => $B, ...)
+      - pattern-not: setTimeout($FN, ...)
+      - pattern-not: setInterval($FN, ...)
+      - pattern-not-inside: setTimeout($FN, ...)
+      - pattern-not-inside: setInterval($FN, ...)
+
+  - id: trinetra.js.command-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      OS command injection: child_process runs a shell command built from a
+      non-constant value. Use execFile/spawn with an argument array and no shell.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: require("child_process").$EXEC($CMD, ...)
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      $CP = require("child_process")
+                      ...
+                  - pattern-inside: |
+                      import $CP from "child_process"
+                      ...
+                  - pattern-inside: |
+                      import * as $CP from "child_process"
+                      ...
+              - pattern: $CP.$EXEC($CMD, ...)
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      const { ..., $EXEC, ... } = require("child_process")
+                      ...
+                  - pattern-inside: |
+                      import { ..., $EXEC, ... } from "child_process"
+                      ...
+              - pattern: $EXEC($CMD, ...)
+      - metavariable-regex:
+          metavariable: $EXEC
+          regex: ^(exec|execSync)$
+      - pattern-not: $F("...", ...)
+      - pattern-not: $O.$F("...", ...)
+
+  - id: trinetra.js.sql-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      SQL injection: the query string is built with concatenation or a template
+      literal. Use placeholders (db.query("... WHERE id = ?", [id])).
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: $DB.$Q("..." + $X, ...)
+          - pattern: $DB.$Q($X + "...", ...)
+          - pattern: $DB.$Q(`...${$X}...`, ...)
+      - metavariable-regex:
+          metavariable: $Q
+          regex: ^(query|execute|raw|\$queryRawUnsafe|\$executeRawUnsafe|run|all|get|exec)$
+      - metavariable-regex:
+          metavariable: $DB
+          regex: (?i)^(db|conn|connection|pool|client|knex|sequelize|prisma|database|sql|mysql|pg)$
+
+  - id: trinetra.js.dom-xss
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      DOM XSS: HTML is written from a non-constant value. Use textContent, or
+      sanitize with DOMPurify before inserting HTML.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = $X
+          - pattern: $EL.outerHTML = $X
+          - pattern: document.write($X)
+          - pattern: document.writeln($X)
+          - pattern: $EL.insertAdjacentHTML($POS, $X)
+      - pattern-not: $EL.innerHTML = "..."
+      - pattern-not: $EL.outerHTML = "..."
+      - pattern-not: document.write("...")
+      - pattern-not: $EL.insertAdjacentHTML($POS, "...")
+      - pattern-not: $EL.innerHTML = DOMPurify.sanitize(...)
+
+  - id: trinetra.js.react-dangerously-set-inner-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      React dangerouslySetInnerHTML with a non-constant value can inject script.
+      Sanitize with DOMPurify.sanitize() first.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    patterns:
+      - pattern: "<$EL dangerouslySetInnerHTML={{__html: $X}} />"
+      - pattern-not: "<$EL dangerouslySetInnerHTML={{__html: \"...\"}} />"
+      - pattern-not: "<$EL dangerouslySetInnerHTML={{__html: DOMPurify.sanitize(...)}} />"
+
+  - id: trinetra.js.express-open-redirect
+    languages: [javascript, typescript]
+    severity: WARNING
+    mode: taint
+    message: >-
+      Open redirect: the redirect target comes from the request. Only redirect
+      to relative paths or allow-listed hosts.
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')"
+      owasp: "A01:2021 - Broken Access Control"
+      confidence: HIGH
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sinks:
+      - pattern: $RES.redirect($U)
+
+  - id: trinetra.js.express-path-traversal
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Path traversal: a file path comes from the request, so "../" can reach
+      files outside the intended folder. Resolve the path and verify it stays
+      within an allowed base directory.
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory"
+      owasp: "A01:2021 - Broken Access Control"
+      confidence: HIGH
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sanitizers:
+      - pattern: path.basename(...)
+    pattern-sinks:
+      - pattern: $RES.sendFile($P, ...)
+      - pattern: fs.$FN($P, ...)
+
+  - id: trinetra.js.express-ssrf
+    languages: [javascript, typescript]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Server-side request forgery: the server fetches a URL taken from the
+      request. Allow-list hosts and schemes before fetching.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery"
+      confidence: HIGH
+    pattern-sources:
+      - pattern: $REQ.query
+      - pattern: $REQ.body
+      - pattern: $REQ.params
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: fetch($URL, ...)
+              - pattern: axios.$M($URL, ...)
+              - pattern: axios($URL, ...)
+              - pattern: http.get($URL, ...)
+              - pattern: https.get($URL, ...)
+          - focus-metavariable: $URL
+
+  - id: trinetra.js.tls-verification-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled, so a man-in-the-middle can read
+      and alter this traffic. Remove rejectUnauthorized: false /
+      NODE_TLS_REJECT_UNAUTHORIZED=0.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: HIGH
+    pattern-either:
+      - pattern: "{..., rejectUnauthorized: false, ...}"
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+      - pattern: process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+
+  - id: trinetra.js.jwt-verification-bypass
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      JWT is decoded without verifying its signature (or "none" is allowed), so
+      anyone can forge it. Use jwt.verify() with a pinned algorithms list.
+    metadata:
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: 'jwt.verify($T, $K, {..., algorithms: [..., "none", ...], ...}, ...)'
+      - patterns:
+          - pattern: $U = jwt.decode(...)
+          - pattern-not-inside: |
+              jwt.verify(...);
+              ...
+
+  - id: trinetra.js.weak-hash
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Weak hash: MD5 and SHA-1 are broken for security use. Use SHA-256+, and
+      bcrypt/scrypt/argon2 for passwords.
+    metadata:
+      cwe: "CWE-328: Use of Weak Hash"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: crypto.createHash("md5")
+      - pattern: crypto.createHash("sha1")
+
+  - id: trinetra.js.insecure-random-token
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Math.random() is predictable; tokens, IDs or passwords made from it can be
+      guessed. Use crypto.randomBytes / crypto.randomUUID.
+    metadata:
+      cwe: "CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: const $NAME = <... Math.random() ...>
+          - pattern: let $NAME = <... Math.random() ...>
+          - pattern: var $NAME = <... Math.random() ...>
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(token|secret|passw|pwd|otp|nonce|salt|session|apikey|api_key|reset).*
+
+  - id: trinetra.js.hardcoded-secret
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Hardcoded credential in source code. Anyone with the code (or its git
+      history) can read it. Load it from an environment variable or a secret
+      manager, and rotate the exposed value.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+      confidence: MEDIUM
+    options:
+      constant_propagation: false
+    patterns:
+      - pattern-either:
+          - pattern: const $NAME = "$VALUE"
+          - pattern: let $NAME = "$VALUE"
+          - pattern: var $NAME = "$VALUE"
+          - pattern: '{..., $NAME: "$VALUE", ...}'
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)^.*(passw|pwd|secret|api_?key|apikey|access_?key|auth_?token|access_?token|private_?key|client_?secret|credential).*$
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)^(?!.*(field|name|header|env|var|url|path|file|prompt|label|length|regex|pattern)$).*$
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: ^(?!(?i:changeme|change_me|your[_-].*|example.*|xxx+|\*+|<.*>|\$\{.*\}|none|null|true|false|password|secret|test|dummy)$)\S{6,}$

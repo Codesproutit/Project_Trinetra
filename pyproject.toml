@@ -37,6 +37,8 @@ packages = ["trinetra"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Deliberately vulnerable Semgrep rule-test targets, not project code.
+extend-exclude = ["tests/semgrep_targets"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
