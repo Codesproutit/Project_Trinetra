@@ -103,6 +103,28 @@ Static analysis of an Android app, feeding the same finding schema, dedup, AI pa
 
 Later phases add the self-evolving learner with a Docker validation gate, and audit reporting.
 
+## What's new (Phase 6 — self-evolving loop)
+
+The tool learns: a novel, dynamically-confirmed finding can become a permanent detection rule —
+but only after it proves itself, so precision is measured, never assumed.
+
+- **Per-discipline brains** — each discipline (web, api, android) owns its own rule store. A
+  pattern learned from an APK never leaks into web rules. A brain also remembers what it has
+  learned (`knows()`), so the same issue is never re-learned.
+- **Rule synthesis** — a *confirmed*, *novel* finding is turned into a candidate detection rule
+  scoped to its discipline.
+- **The Docker fixture gate** — before a rule joins a brain it must **fire on the vulnerable
+  fixture and stay silent on the remediated one**. This is the honest version of the goal:
+  *measured precision on a versioned corpus*, never "zero false positives."
+- **Fail-closed** — the gate needs Semgrep in a container to run. When it isn't available the
+  loop promotes *nothing*: an unvalidated rule never enters a brain. Enable with `--learn`.
+
+> The loop's logic — synthesis, the brain store, the gate, promotion — is fully built and tested
+> against a stand-in rule runner. Actually validating and promoting rules live needs Semgrep +
+> Docker present; without them `--learn` runs and reports that nothing was promoted, by design.
+
+Later phases add audit-grade reporting (CERT-In/CREST) and the live dashboard.
+
 ## Prerequisites
 
 - **Python 3.12+**

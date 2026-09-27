@@ -184,6 +184,37 @@ def test_apk_mode_runs_only_android_engines(tmp_path):
     assert result.sarif_path.exists()
 
 
+def test_learner_promotes_confirmed_finding_in_pipeline(tmp_path):
+    from trinetra.brains import FileBrain
+    from trinetra.learner import Learner, SandboxValidator
+    from trinetra.models.finding import Confidence, Location
+
+    class _Runner:
+        def available(self):
+            return True
+
+        def fires(self, rule, fixture_dir):
+            return fixture_dir == "pos"  # fires on vuln, silent on safe
+
+    confirmed = Finding(
+        discipline="web", source="zap", title="SQLi", rule_id="sqli",
+        severity=Severity.HIGH, confidence=Confidence.CONFIRMED, cwe="CWE-89",
+        location=Location(route="http://t/x"),
+    )
+    reg = EngineRegistry()
+    reg.register(_FakeEngine([confirmed]))
+    settings = Settings(run_dir=tmp_path / "runs")
+    src = tmp_path / "src"
+    src.mkdir()
+    brain = FileBrain("web", tmp_path / "brains")
+    learner = Learner({"web": brain}, SandboxValidator(_Runner(), "pos", "neg"))
+    result = Pipeline(settings=settings, engine_registry=reg, learner=learner).run(
+        RunConfig(source_path=str(src), disciplines=["web"])
+    )
+    assert result.rules_promoted == 1
+    assert brain.knows(confirmed) is True
+
+
 def test_target_mode_requires_scope_manifest(tmp_path):
     reg = EngineRegistry()
     reg.register(_FakeTargetEngine([]))
