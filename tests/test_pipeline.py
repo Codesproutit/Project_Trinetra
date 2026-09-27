@@ -38,6 +38,20 @@ class _FakeTargetEngine(_FakeEngine):
         return list(self._findings)
 
 
+class _FakeApkEngine(_FakeEngine):
+    name = "fakeapk"
+    disciplines = ["android"]
+    input_kind = "apk"
+
+    def __init__(self, findings):
+        super().__init__(findings)
+        self.scanned = None
+
+    def scan(self, target, *, discipline="android"):
+        self.scanned = target
+        return list(self._findings)
+
+
 def _write_scope(tmp_path, host):
     manifest = {
         "engagement": "test",
@@ -140,10 +154,34 @@ def test_pipeline_skips_unavailable_engine(tmp_path):
 def test_runconfig_requires_at_least_one_input():
     with pytest.raises(ValueError):
         RunConfig()
-    # Both together is valid — that's IAST (grey-box) mode.
+    # Both source+target is valid — that's IAST (grey-box) mode.
     assert RunConfig(source_path="x", target_url="http://y/").mode == "iast"
     assert RunConfig(source_path="x").mode == "source"
     assert RunConfig(target_url="http://y/").mode == "target"
+    assert RunConfig(apk_path="app.apk").mode == "android"
+    with pytest.raises(ValueError):
+        RunConfig(apk_path="app.apk", source_path="x")
+
+
+def test_apk_mode_runs_only_android_engines(tmp_path):
+    apk_finding = Finding(
+        discipline="android", source="fakeapk", title="Debuggable", rule_id="dbg",
+        severity=Severity.HIGH, cwe="CWE-489", location=Location(file="AndroidManifest.xml"),
+    )
+    reg = EngineRegistry()
+    reg.register(_FakeEngine([  # a web/source engine that must NOT run in apk mode
+        Finding(discipline="web", source="fake", title="X", rule_id="x", severity=Severity.LOW)
+    ]))
+    apk_engine = _FakeApkEngine([apk_finding])
+    reg.register(apk_engine)
+    settings = Settings(run_dir=tmp_path / "runs")
+    apk = tmp_path / "app.apk"
+    apk.write_text("stub")
+
+    result = Pipeline(settings=settings, engine_registry=reg).run(RunConfig(apk_path=str(apk)))
+    assert {f.source for f in result.findings} == {"fakeapk"}
+    assert apk_engine.scanned == str(apk)
+    assert result.sarif_path.exists()
 
 
 def test_target_mode_requires_scope_manifest(tmp_path):
