@@ -1,0 +1,52 @@
+# A tiny local Semgrep ruleset for offline/air-gapped runs and demos.
+# Point the scanner at it with:  trinetra scan --path ... --semgrep-config examples/semgrep-rules/starter.yaml
+# On a networked machine, use the full registry instead with --semgrep-config auto (the default).
+rules:
+  - id: python-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >
+      OS command injection risk: subprocess called with shell=True. If any part of
+      the command is user-controlled, an attacker can inject arbitrary commands.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern: subprocess.$FN(..., shell=True, ...)
+
+  - id: python-dangerous-eval
+    languages: [python]
+    severity: WARNING
+    message: "Use of eval() on dynamic input can lead to code injection."
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+    pattern: eval(...)
+
+  - id: python-sql-string-injection
+    languages: [python]
+    severity: ERROR
+    message: >
+      SQL injection: a query is built with string interpolation instead of
+      parameterized values. User input can alter the query.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern-either:
+          - pattern: $CUR.execute(f"...")
+          - pattern: $CUR.execute("..." % ...)
+          - pattern: $CUR.execute("...".format(...))
+
+  - id: python-hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: >
+      Hardcoded credential in source code. Secrets committed to a repository can
+      be extracted from history even after removal.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+    patterns:
+      - pattern: $NAME = "..."
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)(password|passwd|secret|api_?key|token|access_?key)

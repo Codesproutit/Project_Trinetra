@@ -1,0 +1,3 @@
+# Old, known-vulnerable pins so the SCA pass has something real to flag.
+flask==0.12.2
+jinja2==2.10

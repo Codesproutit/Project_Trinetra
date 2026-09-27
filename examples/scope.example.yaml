@@ -1,0 +1,14 @@
+# Signed engagement scope. The ScopeGuard enforces this in code — nothing outside
+# in_scope is ever touched, and out_of_scope always wins. Copy and edit per engagement.
+engagement: "ACME demo engagement"
+authorized_by: "Signed-off contact name"
+valid_until: "2027-12-31"
+in_scope:
+  hosts:
+    - app.acme.test
+  cidrs: []
+  url_globs:
+    - "https://app.acme.test/*"
+out_of_scope:
+  - "https://app.acme.test/admin/*"
+rate_limit_rps: 10

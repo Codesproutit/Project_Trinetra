@@ -1,0 +1,30 @@
+# Secrets — never commit real keys or client data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+# Scan runs may contain client data
+.trinetra/
+runs/
+*.sarif
+!tests/**/*.sarif
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
