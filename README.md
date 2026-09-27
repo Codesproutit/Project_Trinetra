@@ -84,6 +84,25 @@ tool's judgement layer, kept honest by a strict gate:
 
 Later phases add the Android track and the self-evolving learner with a Docker validation gate.
 
+## What's new (Phase 5 — Android track)
+
+Static analysis of an Android app, feeding the same finding schema, dedup, AI pass and SARIF:
+
+- **Manifest analysis** — flags the classic `AndroidManifest.xml` misconfigurations: debuggable
+  release builds (CWE-489), cleartext traffic (CWE-319), backups allowed (CWE-530), components
+  exported without a permission guard (CWE-926), and a too-low `minSdkVersion` (CWE-1104).
+- **Hardcoded-secret scan** — finds cloud keys (Google, AWS) and generic credentials shipped
+  inside the APK's resources and decompiled code (CWE-798).
+- **`--apk <file>` lane** — Android is its own discipline; the analyzer runs as an `apk`-kind
+  engine and its findings flow through the same pipeline.
+
+> The analysis runs on **decoded** text. A production APK stores its manifest as compiled binary
+> XML, so scanning one needs `apktool` present (the adapter uses it when installed and skips the
+> manifest with a clear message when it isn't). The dynamic side — live traffic capture via
+> mitmproxy/Frida on a device or emulator — is a later increment; this phase is the static core.
+
+Later phases add the self-evolving learner with a Docker validation gate, and audit reporting.
+
 ## Prerequisites
 
 - **Python 3.12+**
@@ -108,6 +127,9 @@ python -m trinetra scan --target http://localhost:3000 --scope examples/scope.ex
 # IAST (grey-box): SAST + DAST in one pass, correlating static sinks with runtime proof:
 python -m trinetra scan --path ./target --target http://localhost:3000 \
     --scope examples/scope.example.yaml
+
+# Android: statically analyze an APK (manifest flaws + hardcoded secrets):
+python -m trinetra scan --apk ./app.apk
 ```
 
 DAST engines (ZAP, Nuclei) run against a live URL, so they need the pinned engine

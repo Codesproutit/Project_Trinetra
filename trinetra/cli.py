@@ -19,6 +19,7 @@ from trinetra.ai import AiReviewer
 from trinetra.engines.base import registry
 from trinetra.engines.dast.nuclei import NucleiAdapter
 from trinetra.engines.dast.zap import ZapAdapter
+from trinetra.engines.mobile.android import ApkStaticAdapter
 from trinetra.engines.sast.semgrep import SemgrepAdapter
 from trinetra.engines.sca.sca_scanner import ScaScanner
 from trinetra.models.finding import Severity
@@ -50,6 +51,8 @@ def _register_default_engines(semgrep_config: str = "auto") -> None:
         registry.register(ZapAdapter())
     if "nuclei" not in names:
         registry.register(NucleiAdapter())
+    if "apk_static" not in names:
+        registry.register(ApkStaticAdapter())
 
 
 def _build_reviewer() -> AiReviewer:
@@ -73,6 +76,10 @@ def scan(
         str | None,
         typer.Option("--target", "-t", help="Running target URL to scan (DAST); needs --scope"),
     ] = None,
+    apk: Annotated[
+        str | None,
+        typer.Option("--apk", help="Path to an Android .apk to scan statically"),
+    ] = None,
     discipline: Annotated[
         list[str], typer.Option("--discipline", "-d", help="web | api (repeatable)")
     ] = None,
@@ -94,9 +101,12 @@ def scan(
         typer.Option("--ai/--no-ai", help="Run the AI cognitive pass (BYOK; needs an API key)"),
     ] = False,
 ) -> None:
-    """Scan source (SAST+SCA), a target URL (DAST), or both (IAST) → SARIF report."""
-    if not path and not target:
-        console.print("[bold red]Provide[/] --path[bold red],[/] --target[bold red], or both.[/]")
+    """Scan source (SAST+SCA), a URL (DAST), both (IAST), or an APK (Android) → SARIF."""
+    if apk and (path or target):
+        console.print("[bold red]--apk is its own scan; don't combine it with[/] --path/--target.")
+        raise typer.Exit(code=2)
+    if not path and not target and not apk:
+        console.print("[bold red]Provide[/] --path[bold red],[/] --target[bold red], or[/] --apk.")
         raise typer.Exit(code=2)
     if target and not scope:
         console.print(
@@ -109,7 +119,8 @@ def scan(
     cfg = RunConfig(
         source_path=path,
         target_url=target,
-        disciplines=discipline or ["web"],
+        apk_path=apk,
+        disciplines=discipline or (["android"] if apk else ["web"]),
         engines=engine,
         scope_manifest=scope,
     )

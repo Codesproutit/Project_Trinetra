@@ -56,19 +56,27 @@ class OutOfScopeErrorNoManifest(OutOfScopeError):
 
 @dataclass
 class RunConfig:
-    # source_path => SAST/SCA; target_url => DAST; both => IAST (grey-box).
+    # source_path => SAST/SCA; target_url => DAST; both => IAST (grey-box);
+    # apk_path => Android static (its own lane, not combined with source/target).
     source_path: str | None = None
     target_url: str | None = None
+    apk_path: str | None = None
     disciplines: list[str] = field(default_factory=lambda: ["web"])
     engines: list[str] | None = None  # None => all engines matching the disciplines
     scope_manifest: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.source_path and not self.target_url:
-            raise ValueError("Provide source_path, target_url, or both (IAST).")
+        if self.apk_path and (self.source_path or self.target_url):
+            raise ValueError("apk_path is its own lane; don't combine it with source/target.")
+        if not self.source_path and not self.target_url and not self.apk_path:
+            raise ValueError("Provide source_path, target_url, both (IAST), or apk_path.")
+        if self.apk_path and self.disciplines == ["web"]:
+            self.disciplines = ["android"]
 
     @property
     def mode(self) -> str:
+        if self.apk_path:
+            return "android"
         if self.source_path and self.target_url:
             return "iast"
         return "source" if self.source_path else "target"
@@ -80,6 +88,10 @@ class RunConfig:
     @property
     def runs_target(self) -> bool:
         return self.target_url is not None
+
+    @property
+    def runs_apk(self) -> bool:
+        return self.apk_path is not None
 
 
 @dataclass
@@ -129,10 +141,10 @@ class Pipeline:
         if cfg.runs_target:
             # Deny-by-default: a network target is never auto-authorized.
             raise OutOfScopeErrorNoManifest()
-        # Local source-scan mode: authorize only the given path, nothing networked.
-        resolved = str(Path(cfg.source_path).resolve())
+        # Local scan mode (source or APK): authorize only the given local path.
+        resolved = str(Path(cfg.source_path or cfg.apk_path).resolve())
         manifest = ScopeManifest(
-            engagement="local-source-scan",
+            engagement="local-scan",
             authorized_by="local operator",
             in_scope=ScopeRules(url_globs=[resolved, f"{resolved}/*"]),
             rate_limit_rps=self.settings.default_rps,
@@ -141,13 +153,12 @@ class Pipeline:
 
     def _assert_scope(self, cfg: RunConfig, guard: ScopeGuard) -> None:
         # The network target is what an engagement authorizes; a local source path
-        # is the operator's own checkout. In source-only mode the auto-manifest
-        # authorizes that path.
+        # or APK file is the operator's own artifact.
         if cfg.runs_target:
             parsed = urlparse(cfg.target_url)
             guard.assert_in_scope(Target(url=cfg.target_url, host=parsed.hostname))
         else:
-            guard.assert_in_scope(Target(path=str(Path(cfg.source_path).resolve())))
+            guard.assert_in_scope(Target(path=str(Path(cfg.source_path or cfg.apk_path).resolve())))
 
     def _run_engines(self, cfg: RunConfig, input_kind: str, scan_input: str) -> _EngineOutcome:
         findings: list[Finding] = []
@@ -178,6 +189,13 @@ class Pipeline:
         if cfg.runs_source:
             out = self._run_engines(cfg, "source", cfg.source_path)
             static_findings, skipped, failed = out.findings, out.skipped, out.failed
+
+        # Android lane: static APK analysis feeds the same schema/dedup/AI pass.
+        if cfg.runs_apk:
+            out = self._run_engines(cfg, "apk", cfg.apk_path)
+            static_findings += out.findings
+            skipped += out.skipped
+            failed += out.failed
 
         # IAST: derive the verification queue from the static sinks and mint OAST
         # callbacks for the blind ones before the dynamic scan runs.
